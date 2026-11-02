@@ -1,0 +1,107 @@
+services:
+  postgres:
+    extends: {file: ../infrastructure.json, service: postgres}
+    entrypoint: [sh, /usr/local/bin/quivr-postgres]
+    environment:
+      POSTGRES_USER: quivr
+      POSTGRES_DB: quivr
+      POSTGRES_PASSWORD: ${QUIVR_DB_PASSWORD:?}
+      QUIVR_POSTGRES_MEMORY_MB: ${QUIVR_POSTGRES_MEMORY_MB:-}
+      QUIVR_POSTGRES_VOLUME_MB: ${QUIVR_POSTGRES_VOLUME_MB:-}
+      QUIVR_POSTGRES_MAX_WAL_SIZE: ${QUIVR_POSTGRES_MAX_WAL_SIZE:-}
+      QUIVR_POSTGRES_MIN_WAL_SIZE: ${QUIVR_POSTGRES_MIN_WAL_SIZE:-}
+      QUIVR_POSTGRES_MAX_CONNECTIONS: ${QUIVR_POSTGRES_MAX_CONNECTIONS:-}
+      QUIVR_POSTGRES_SHARED_BUFFERS: ${QUIVR_POSTGRES_SHARED_BUFFERS:-}
+      QUIVR_POSTGRES_EFFECTIVE_CACHE_SIZE: ${QUIVR_POSTGRES_EFFECTIVE_CACHE_SIZE:-}
+      QUIVR_POSTGRES_WORK_MEM: ${QUIVR_POSTGRES_WORK_MEM:-}
+      QUIVR_POSTGRES_MAINTENANCE_WORK_MEM: ${QUIVR_POSTGRES_MAINTENANCE_WORK_MEM:-}
+      QUIVR_POSTGRES_RANDOM_PAGE_COST: ${QUIVR_POSTGRES_RANDOM_PAGE_COST:-}
+      QUIVR_POSTGRES_EFFECTIVE_IO_CONCURRENCY: ${QUIVR_POSTGRES_EFFECTIVE_IO_CONCURRENCY:-}
+      QUIVR_POSTGRES_CHECKPOINT_TIMEOUT: ${QUIVR_POSTGRES_CHECKPOINT_TIMEOUT:-}
+      QUIVR_POSTGRES_WAL_COMPRESSION: ${QUIVR_POSTGRES_WAL_COMPRESSION:-}
+      QUIVR_POSTGRES_AUTOPREWARM: ${QUIVR_POSTGRES_AUTOPREWARM:-}
+      QUIVR_POSTGRES_JIT: ${QUIVR_POSTGRES_JIT:-}
+      QUIVR_POSTGRES_SYNCHRONOUS_COMMIT: ${QUIVR_POSTGRES_SYNCHRONOUS_COMMIT:-}
+      QUIVR_POSTGRES_STAT_STATEMENTS_TRACK: ${QUIVR_POSTGRES_STAT_STATEMENTS_TRACK:-}
+    ports:
+      - "127.0.0.1::5432"
+    volumes:
+      - data:/var/lib/postgresql/data
+      - ../postgres/start.sh:/usr/local/bin/quivr-postgres:ro
+      - ../postgres/defaults.sh:/usr/local/bin/defaults.sh:ro
+      - ../postgres/init.sql:/docker-entrypoint-initdb.d/quivr.sql:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "3"
+    healthcheck:
+      # The initialization server accepts sockets before the final TCP server starts.
+      test: [CMD-SHELL, pg_isready -h 127.0.0.1 -U quivr -d quivr]
+      interval: 1s
+      timeout: 2s
+      retries: 40
+  temporal:
+    image: temporalio/temporal:1.8.3@sha256:cea463d98a8d6def4420f903ea5c3fcd0d85c8d10fbcc2770a50c12fff2eb26d
+    command: [server, start-dev, --ip, 0.0.0.0, --headless, --db-filename, /home/temporal/temporal.db]
+    ports:
+      - "127.0.0.1::7233"
+    volumes:
+      - temporal-data:/home/temporal
+    healthcheck:
+      test: [CMD, temporal, operator, cluster, health, --address, '127.0.0.1:7233']
+      interval: 1s
+      timeout: 2s
+      retries: 40
+    logging:
+      driver: json-file
+      options: {max-size: 1m, max-file: '3'}
+  seaweed:
+    image: chrislusf/seaweedfs:4.45@sha256:fc9f76fa993ad69966ffeb2f65d0318fcae39c6f8e20cf68ef7b3a5cb97769e5
+    command: [mini, '-dir=/data', '-s3.config=/etc/seaweedfs/s3.json']
+    ports:
+      - "127.0.0.1::8333"
+    volumes:
+      - ${QUIVR_LOCAL_ROOT:?}/s3.json:/etc/seaweedfs/s3.json:ro
+      - seaweed-data:/data
+    logging:
+      driver: json-file
+      options: {max-size: 1m, max-file: '3'}
+  weaviate:
+    extends: {file: ../infrastructure.json, service: weaviate}
+    environment:
+      CLUSTER_HOSTNAME: quivr-local
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - weaviate-data:/var/lib/weaviate
+    logging:
+      driver: json-file
+      options: {max-size: 1m, max-file: '3'}
+
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference@sha256:ad950d30878eceb72aaf32024d26fa2b1d04a75304fa0b4776b49aa1941fea07
+    command: [--model-id, /model, --dtype, float32, --pooling, mean, --max-client-batch-size, '32', --max-batch-tokens, '8192', --auto-truncate, 'false', --tokenization-workers, '2']
+    environment:
+      HF_HUB_OFFLINE: '1'
+    volumes:
+      - ${QUIVR_MODEL_ROOT:?}:/model:ro
+    networks: [inference]
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost/health]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    logging:
+      driver: json-file
+      options: {max-size: 1m, max-file: '3'}
+
+networks:
+  inference:
+    internal: true
+
+volumes:
+  data:
+  temporal-data:
+  seaweed-data:
+  weaviate-data:

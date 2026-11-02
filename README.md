@@ -1,154 +1,119 @@
-# Quivr - Your Second Brain, Empowered by Generative AI
+# Quivr
 
-<div align="center">
-    <img src="./logo.png" alt="Quivr-logo" width="30%"  style="border-radius: 50%; padding-bottom: 20px"/>
-</div>
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/The-Vibe-Company/quivr)
 
-[![Discord Follow](https://dcbadge.vercel.app/api/server/HUpRgp2HG8?style=flat)](https://discord.gg/HUpRgp2HG8)
-[![GitHub Repo stars](https://img.shields.io/github/stars/quivrhq/quivr?style=social)](https://github.com/quivrhq/quivr)
-[![Twitter Follow](https://img.shields.io/twitter/follow/StanGirard?style=social)](https://twitter.com/_StanGirard)
+**An open-source engine for content that keeps arriving: store it, search it, and get
+alerted when something new matches a topic you follow.**
 
-Quivr, your second brain, utilizes the power of GenerativeAI to be your personal assistant ! Think of it as Obsidian, but turbocharged with AI capabilities.
+You send Quivr documents (news articles, emails, posts, PDFs), or let it collect them
+from RSS feeds, Microsoft 365 mailboxes and X lists. Quivr keeps every version, makes
+each document searchable within seconds, and checks it against your saved alerts. Your
+application talks to Quivr over an HTTP API; Quivr has no user interface of its own.
 
-[Roadmap here](https://docs.quivr.app/docs/roadmap)
+Quivr is developed by [The Vibe Company](https://www.thevibecompany.co), the AI agency
+created by the Quivr team.
 
-## Key Features 🎯
+> **Status: Quivr 2.** From 2.0.0 on, the HTTP API (`/v0`) stays compatible across
+> 2.x releases and upgrades keep your data in place; see
+> [Versions and compatibility](https://docs.quivr.thevibecompany.co/reference/compatibility)
+> and [Known limits](https://docs.quivr.thevibecompany.co/reference/known-limits).
 
-- **Fast and Efficient**: Designed with speed and efficiency at its core. Quivr ensures rapid access to your data.
-- **Secure**: Your data, your control. Always.
-- **OS Compatible**: Ubuntu 22 or newer.
-- **File Compatibility**: Text, Markdown, PDF, Powerpoint, Excel, CSV, Word, Audio, Video
-- **Open Source**: Freedom is beautiful, and so is Quivr. Open source and free to use.
-- **Public/Private**: Share your brains with your users via a public link, or keep them private.
-- **Marketplace**: Share your brains with the world, or use other people's brains to boost your productivity.
-- **Offline Mode**: Quivr works offline, so you can access your data anytime, anywhere.
+## What you can do with it
 
-## Demo Highlights 🎥
+- **Collect content** you send one by one or in batches, or that Quivr pulls from
+  sources on a schedule. Files such as PDFs are read by plugins.
+- **Search** by keywords, by meaning, or both. Every result points to the exact passage,
+  document and version it comes from, so you can always cite it.
+- **Follow a topic.** Save an alert such as `"harbour strike" AND (ferry OR port)`, or a
+  plain-language description, and Quivr records every new document that matches, with
+  the reason. Your application reads the matches or receives them as signed webhooks.
+- **Keep history.** A correction becomes a new version; the old one stays readable. A
+  withdrawn document leaves search at once, and alerts that caught it are told.
+- **Plug in your own logic.** File formats, sources, embedding models, ranking and alert
+  rules are plugins: small HTTP services you can replace, in any language.
+- **Let AI agents use it.** `quivr mcp` lets an agent search Quivr and quote what it
+  finds, with the source of every passage.
 
-https://github.com/quivrhq/quivr/assets/19614572/a6463b73-76c7-4bc0-978d-70562dca71f5
+## How it works
 
-## Getting Started 🚀
+```mermaid
+flowchart LR
+    sources[Sources and<br/>your application] -->|documents| api[Quivr API]
+    api --> store[(PostgreSQL + object storage<br/>every version, kept safely)]
+    store --> worker[Quivr worker]
+    worker <-->|read, cut, embed,<br/>rank, judge alerts| plugins[Plugins]
+    worker --> index[(Search index)]
+    app[Your application] <-->|search, alerts, changes| api
+```
 
-Follow these instructions to get a copy of the project up and running on your local machine for development and testing purposes.
+Quivr confirms a document only once it is stored, then processes it in the background:
+an outage delays processing but never loses what was confirmed. The search index can
+always be rebuilt from storage. [How Quivr works](https://docs.quivr.thevibecompany.co/how-quivr-works)
+explains the parts and the guarantees.
 
-You can find everything on the [documentation](https://docs.quivr.app/).
+## Try it
 
-### Prerequisites 📋
+You need Linux on x86_64 or a Mac with Apple Silicon, Docker with Compose v2, the Go
+version in [`go.mod`](go.mod), Python 3.12 with `venv`, and `jq`. The first start
+downloads about 1 GB.
 
-Ensure you have the following installed:
+```bash
+git clone https://github.com/The-Vibe-Company/quivr.git && cd quivr
+make dev                 # start Quivr and its dependencies in Docker
+eval "$(make -s env)"    # point this shell at the API, with a local key
+```
 
-- Docker
-- Docker Compose
+Then follow the [Quickstart](https://docs.quivr.thevibecompany.co/quickstart): create a
+collection, add an article, find it by keyword and by meaning, and get alerted on a
+topic, in about fifteen minutes. `make demo` adds a web app on top, at
+http://127.0.0.1:5183 ([`quivr-search/`](quivr-search/README.md)).
 
-### 60 seconds Installation 💽
+To install Quivr on a server from published images, without a checkout, see
+[Run Quivr on one machine](https://docs.quivr.thevibecompany.co/run-quivr/single-machine).
 
-You can find the installation video [here](https://www.youtube.com/watch?v=cXBa6dZJN48).
+## Documentation
 
-- **Step 0**: Supabase CLI
+Everything is on [docs.quivr.thevibecompany.co](https://docs.quivr.thevibecompany.co):
 
-  Follow the instructions [here](https://supabase.com/docs/guides/cli/getting-started) to install the Supabase CLI that is required.
+| If you want to… | Start with |
+| --- | --- |
+| Understand Quivr | [Introduction](https://docs.quivr.thevibecompany.co/), then [Core concepts](https://docs.quivr.thevibecompany.co/concepts) |
+| Build an application on it | [Quickstart](https://docs.quivr.thevibecompany.co/quickstart), then the guides under *Use Quivr* |
+| Install and operate it | [Operate a Quivr deployment](https://docs.quivr.thevibecompany.co/run-quivr/overview) |
+| Write a plugin | [How plugins work](https://docs.quivr.thevibecompany.co/plugins/overview), then [Build your first plugin](https://docs.quivr.thevibecompany.co/plugins/first-plugin) |
+| Look up an endpoint, command or setting | [Reference](https://docs.quivr.thevibecompany.co/api-reference/overview) |
 
-  ```bash
-  supabase -v # Check that the installation worked
-  ```
+The site's source is [`docs-site/`](docs-site/). Documentation for people changing this
+repository is listed on [the contributor start page](docs/start/contributor.md).
 
+## Repository layout
 
-- **Step 1**: Clone the repository:
+```text
+cmd/quivr/       the single quivr binary: api, worker, migrate, plugin tools, search, mcp
+internal/        the engine, one Go package per domain module
+contracts/       the HTTP API (OpenAPI) and plugin protocol contracts
+sdks/            Go and Python kits for writing plugins
+plugins/         first-party plugins: alerts, sources, PDF, ingestion, retrieval…
+client/          Go client generated from the HTTP contract
+migrations/      PostgreSQL migrations
+deploy/          Compose, Railway and image build files
+quivr-search/    demo web app built on the public API
+docs-site/       the documentation site
+docs/            contributor docs, decisions (docs/adr/) and dated records (docs/dated/)
+scripts/         local stack, checks and measurement tooling
+```
 
-  ```bash
-  git clone https://github.com/quivrhq/quivr.git && cd quivr
-  ```
+## Contributing
 
-- **Step 2**: Copy the `.env.example` files
+Read [`AGENTS.md`](AGENTS.md) for the rules and [`CONTEXT.md`](CONTEXT.md) for the
+domain vocabulary, then [the contributor start page](docs/start/contributor.md). Run
+`make check` (about two minutes, no Docker) before pushing; `make verify` runs the
+end-to-end journeys on an isolated stack. Pull request titles follow Commitizen, for
+example `feat(ingestion): accept record versions`.
 
-  ```bash
-  cp .env.example .env
-  ```
+Report security issues privately: see [`SECURITY.md`](SECURITY.md).
 
-- **Step 3**: Update the `.env` files
+## License
 
-  ```bash
-  vim .env # or emacs or vscode or nano
-  ```
-
-  Update **OPENAI_API_KEY** in the `.env` file.
-
-  You just need to update the `OPENAI_API_KEY` variable in the `.env` file. You can get your API key [here](https://platform.openai.com/api-keys). You need to create an account first. And put your credit card information. Don't worry, you won't be charged unless you use the API. You can find more information about the pricing [here](https://openai.com/pricing/).
-
-
-- **Step 4**: Launch the project
-
-  ```bash
-  cd backend && supabase start
-  ```
-  and then 
-  ```bash
-  cd ../
-  docker compose pull
-  docker compose up
-  ```
-
-  If you have a Mac, go to Docker Desktop > Settings > General and check that the "file sharing implementation" is set to `VirtioFS`.
-
-  If you are a developer, you can run the project in development mode with the following command: `docker compose -f docker-compose.dev.yml up --build`
-
-- **Step 5**: Login to the app
-
-  You can now sign in to the app with `admin@quivr.app` & `admin`. You can access the app at [http://localhost:3000/login](http://localhost:3000/login).
-
-  You can access Quivr backend API at [http://localhost:5050/docs](http://localhost:5050/docs)
-
-  You can access supabase at [http://localhost:54323](http://localhost:54323)
-
-## Updating Quivr 🚀
-
-- **Step 1**: Pull the latest changes
-
-  ```bash
-  git pull
-  ```
-
-- **Step 2**: Update the migration
-
-  ```bash
-  supabase migration up
-  ```
-
-
-## Contributors ✨
-
-Thanks go to these wonderful people:
-<a href="https://github.com/quivrhq/quivr/graphs/contributors">
-<img src="https://contrib.rocks/image?repo=quivrhq/quivr" />
-</a>
-
-## Contribute 🤝
-
-Did you get a pull request? Open it, and we'll review it as soon as possible. Check out our project board [here](https://github.com/users/StanGirard/projects/5) to see what we're currently focused on, and feel free to bring your fresh ideas to the table!
-
-- [Open Issues](https://github.com/quivrhq/quivr/issues)
-- [Open Pull Requests](https://github.com/quivrhq/quivr/pulls)
-- [Good First Issues](https://github.com/quivrhq/quivr/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)
-- [Frontend Issues](https://github.com/quivrhq/quivr/issues?q=is%3Aopen+is%3Aissue+label%3Afrontend)
-- [Backend Issues](https://github.com/quivrhq/quivr/issues?q=is%3Aopen+is%3Aissue+label%3Abackend)
-- [Translate](https://docs.quivr.app/docs/Developers/contribution/guidelines#translations)
-
-## Partners ❤️
-
-This project would not be possible without the support of our partners. Thank you for your support!
-
-
-<a href="https://ycombinator.com/">
-    <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/b/b2/Y_Combinator_logo.svg/1200px-Y_Combinator_logo.svg.png" alt="YCombinator" style="padding: 10px" width="70px">
-</a>
-<a href="https://www.theodo.fr/">
-  <img src="https://avatars.githubusercontent.com/u/332041?s=200&v=4" alt="Theodo" style="padding: 10px" width="70px">
-</a>
-
-## License 📄
-
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details
-
-## Stars History 📈
-
-[![Star History Chart](https://api.star-history.com/svg?repos=quivrhq/quivr&type=Timeline)](https://star-history.com/#quivrhq/quivr&Timeline)
+MIT — see [LICENSE](LICENSE).

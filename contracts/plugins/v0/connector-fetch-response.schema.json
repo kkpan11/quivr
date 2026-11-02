@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "connector fetch response, v0",
+  "description": "200 body of POST /v0/contributions/connector/fetch. The engine validates every item as it validates a client submission before accepting it, and advances the checkpoint only after the items are durably accepted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "items",
+    "checkpoint",
+    "more"
+  ],
+  "properties": {
+    "items": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {
+        "$ref": "#/$defs/Item"
+      },
+      "description": "At most the declared max_items."
+    },
+    "checkpoint": {
+      "description": "The opaque checkpoint that resumes after this page (any JSON value, at most the declared limits.max_checkpoint_bytes serialized, 64 KiB by default). Return the request's checkpoint unchanged when nothing moved."
+    },
+    "more": {
+      "type": "boolean",
+      "description": "true asks for another page in the same run; the checkpoint must then have moved."
+    },
+    "reads": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Source resources this page read; feeds the per-UTC-day usage counters."
+    },
+    "diagnostics": {
+      "type": "object",
+      "description": "Kind-defined diagnostics exposed as Connector Health diagnostics (at most 16 KiB serialized); the latest page's value replaces the previous one."
+    },
+    "notice": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "maxLength": 64,
+      "description": "A condition to report on a run that completed normally, such as a spend cap; it ends the run."
+    },
+    "not_due": {
+      "type": "boolean",
+      "description": "true: the source asked not to be polled yet (for example an RSS ttl). The run is skipped: no items, more false and the request's checkpoint unchanged."
+    },
+    "push": {
+      "$ref": "#/$defs/PushStatus"
+    },
+    "submission_concurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 32,
+      "default": 1,
+      "description": "Since Plugin API 0.15.0: maximum concurrent item submissions within this page (1 to 32). Omitted submits items serially. The checkpoint advances only after every submission completes successfully or is permanently rejected. Repeated keys require allow_repeated_record_keys; only independent keys may run concurrently."
+    },
+    "allow_repeated_record_keys": {
+      "type": "boolean",
+      "default": false,
+      "description": "Since Plugin API 0.19.0: true admits multiple revisions of the same Record Key in this fetch page. Items of each key are submitted in their listed source order, with at most one in flight per key. Independent keys may run concurrently. Omitted or false preserves the unique-key requirement. Checkpoints advance only after the entire page is accounted for; replay retains each revision\u2019s idempotency key. This field must be omitted on older APIs."
+    }
+  },
+  "$defs": {
+    "Item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_key"
+      ],
+      "description": "One source item that is new or changed since the checkpoint: the same ingestion command a client submits, with producer = the Connector Instance. Exactly one of content and withdraw: true.",
+      "properties": {
+        "record_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Stable source identity within the Source Namespace."
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Identifies the item content; absent derives it from the content. Set it when the item has attachments, so an unchanged item is recognised before anything is downloaded."
+        },
+        "source_position": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Optional monotonic Source Position."
+        },
+        "content": {
+          "oneOf": [
+            {
+              "$ref": "../../shared/v0/manifest.schema.json#/$defs/TextContent"
+            },
+            {
+              "$ref": "#/$defs/ConnectorManifestContent"
+            }
+          ],
+          "description": "Text or a Manifest. A connector Manifest carries no Blob Parts: binary Parts are attachments. Since Plugin API 0.15, absent or empty text parts submit the verified Blob for normalization only with exactly one attachment whose key and role are source, no parent_key or Part extensions, and no relations."
+        },
+        "extensions": {
+          "$ref": "../../shared/v0/manifest.schema.json#/$defs/Extensions",
+          "description": "Record Version extensions, in namespaces the plugin declares or the reserved quivr.metadata namespace (schema version 1)."
+        },
+        "withdraw": {
+          "type": "boolean",
+          "description": "true asks for a Tombstone instead of a new version, for example a post deleted at the source."
+        },
+        "attachments": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/Attachment"
+          }
+        }
+      }
+    },
+    "Attachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "role",
+        "media_type",
+        "ref"
+      ],
+      "description": "A binary Part of the item. Since Plugin API 0.4, the core asks for the bytes later through describe_attachment and upload_attachment, only when the item is not already accepted; the manifest must declare contributions.connector.attachments.",
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "parent_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "media_type": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$",
+          "maxLength": 255
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Announced size, when the source provides it; the exact size when sha256 is set."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase hex SHA-256 of the exact bytes, when the plugin already knows them; the core then skips describe_attachment."
+        },
+        "extensions": {
+          "$ref": "../../shared/v0/manifest.schema.json#/$defs/Extensions"
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Opaque handle the plugin understands, given back when the core asks for the bytes."
+        }
+      },
+      "dependentRequired": {
+        "sha256": [
+          "size_bytes"
+        ]
+      }
+    },
+    "PushStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state"
+      ],
+      "description": "Since Plugin API 0.5, for a push kind: the plugin's view of the push channel it sets up at the source (a registered webhook and its subscriptions). active: deliveries are expected. pending: not set up yet; code may say why. failed: the source refused or broke the setup, and polling carries the collection alone; error_class access shows as the access_error Connector Health state. The core keeps the latest report.",
+      "properties": {
+        "state": {
+          "enum": [
+            "active",
+            "pending",
+            "failed"
+          ]
+        },
+        "error_class": {
+          "enum": [
+            "access",
+            "transient",
+            "source"
+          ],
+          "description": "Required when state is failed, absent otherwise."
+        },
+        "code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "maxLength": 64,
+          "description": "Required when state is failed; an optional reason when pending; absent when active."
+        },
+        "poll_interval_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 86400,
+          "description": "Only with state active: while deliveries arrive, the core runs pull at most this often (the greater of this and the instance's interval), as a safety net. It returns to the instance's interval as soon as push degrades."
+        }
+      }
+    },
+    "ConnectorManifestContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "manifest"
+          ]
+        },
+        "parts": {
+          "type": "array",
+          "items": {
+            "$ref": "../../shared/v0/manifest.schema.json#/$defs/Part"
+          }
+        },
+        "relations": {
+          "type": "array",
+          "items": {
+            "$ref": "../../shared/v0/manifest.schema.json#/$defs/RelationInput"
+          }
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "description": "Connector Manifest content. Since Plugin API 0.15, text parts may be absent or empty for raw Blob input: exactly one attachment with key and role source, no parent_key or Part extensions, and no relations. The engine submits the verified Blob for normalization. With text parts, attachments supply ordinary binary Manifest Parts."
+    }
+  }
+}

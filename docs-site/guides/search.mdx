@@ -1,0 +1,389 @@
+---
+title: "Search"
+description: "Find articles by keyword or by meaning, narrow results to some sources, and cite exactly where a passage comes from."
+keywords: ["search", "lexical", "semantic", "hybrid", "profile", "excerpt", "quivr search"]
+---
+
+`POST /v0/search` returns each matching document once with its best passage through the default retrieval plugin, across up to 16 Corpora, with the exact excerpt of each. This page covers the options you will use; the [API reference](/api-reference/overview) lists every endpoint and field.
+
+## Prerequisites
+
+- `QUIVR_API_URL` and a `QUIVR_API_KEY` with `content:read` and `search:query` on the Corpora you search ([Quickstart](/quickstart)). The setup below also creates a Corpus and articles, which needs `corpora:write` and `content:write` on every Corpus, as the key `eval "$(make -s env)"` exports does.
+- Some articles. These examples use a Corpus with two, from two sources:
+
+{/* runnable */}
+```bash
+curl -s -X POST "$QUIVR_API_URL/v0/corpora" -H "Authorization: Bearer $QUIVR_API_KEY" \
+  -H "Content-Type: application/json" -d '{"name": "Harbour news", "idempotency_key": "guide-search"}' | jq '{corpus_id}'
+```
+
+{/* output */}
+```json
+{"corpus_id": "{{CORPUS_ID}}"}
+```
+
+```bash
+export CORPUS_ID=<the corpus_id above>
+```
+
+{/* runnable */}
+```bash
+curl -s -X POST "$QUIVR_API_URL/v0/records/batch" -H "Authorization: Bearer $QUIVR_API_KEY" \
+  -H "Content-Type: application/json" -d @- <<EOF | jq '[.items[].receipt.state]'
+{"items": [
+  {"idempotency_key": "guide-search-storm", "source": {"corpus_id": "$CORPUS_ID", "namespace": "wire", "record_key": "storm"},
+   "extensions": {"quivr.metadata": {"schema_version": "1", "data": {"language": "en"}}},
+   "content": {"kind": "text", "text": "A storm closed the harbour and cancelled every ferry."}},
+  {"idempotency_key": "guide-search-festival", "source": {"corpus_id": "$CORPUS_ID", "namespace": "blog", "record_key": "festival"},
+   "extensions": {"quivr.metadata": {"schema_version": "1", "data": {"language": "en"}}},
+   "content": {"kind": "text", "text": "The harbour festival returns with boat races and music."}}
+]}
+EOF
+```
+
+{/* output */}
+```json
+["...", "..."]
+```
+
+Quivr indexes the articles in the background, usually within seconds, so a search sent at once can miss them. Each batch item's `receipt` has a `receipt_id`: read `GET /v0/ingestion-receipts/{receipt_id}` until `availability.searchable` is `true`, as [Add content](/guides/add-content#send-an-article-with-a-title) shows. If `availability.state` reads `quarantined` instead, the article is on hold until an operator reprocesses it; [If you can't find it](/guides/add-content#if-you-cant-find-it) lists the other cases.
+
+## Choose a mode
+
+| `mode` | Use it when | Needs |
+| --- | --- | --- |
+| `lexical` | the words matter: names, codes, exact terms | nothing: available as soon as a Version is indexed |
+| `semantic` | the meaning matters, in other words or another language | the passages' vectors, computed seconds after ingestion |
+| `hybrid` | you want both, ranked together. This is the default. | keywords remain available while vectors are rebuilt |
+
+When served vectors are unavailable, hybrid search returns keyword results with
+`retrieval_profile.degraded`. An entry whose `reason` is `vectors_unavailable`
+names the affected collections in `corpus_ids`, even when no documents match.
+Other collections keep their hybrid results. You can show this notice until a
+later response omits the marker; rebuilding needs no client-side retry loop.
+
+An explicit `semantic` request has no keyword fallback. A collection with eligible
+documents returns `422 unsupported_search` when served vectors are unavailable.
+With no eligible documents, including after the last Record is withdrawn, it
+returns empty results. Stale or unknown coverage counts
+alone do not disable a valid vector route. Model, index and storage outages
+keep their error responses; they do not become keyword-only successes.
+
+{/* runnable retry */}
+```bash
+curl -s -X POST "$QUIVR_API_URL/v0/search" -H "Authorization: Bearer $QUIVR_API_KEY" -H "Content-Type: application/json" \
+  -d @- <<EOF | jq '{items: [.items[] | {rank, part_key, text: .excerpt.text}], profile: .retrieval_profile.name}'
+{"query": "ferry", "corpus_ids": ["$CORPUS_ID"], "mode": "lexical", "limit": 5}
+EOF
+```
+
+{/* output */}
+```json
+{"items": [{"rank": 1, "part_key": "body", "text": "A storm closed the harbour and cancelled every ferry."}], "profile": "default"}
+```
+
+`limit` is 10 by default and 50 at most. There is no pagination: ask for what you will show.
+
+A query has at most 8,192 characters. When vector search runs, the embedding model also caps its length (256 tokens with the first-party model); a longer query is refused with `422 query_too_long`, never truncated.
+
+## Narrow to some sources
+
+`filter.source_namespaces` keeps only Records from those Source Namespaces. The filter applies before ranking, so you get a source's best matches even when other sources would outrank them:
+
+{/* runnable retry */}
+```bash
+curl -s -X POST "$QUIVR_API_URL/v0/search" -H "Authorization: Bearer $QUIVR_API_KEY" -H "Content-Type: application/json" \
+  -d @- <<EOF | jq '[.items[].excerpt.text]'
+{"query": "harbour", "corpus_ids": ["$CORPUS_ID"], "mode": "lexical", "filter": {"source_namespaces": ["blog"]}}
+EOF
+```
+
+{/* output */}
+```json
+["The harbour festival returns with boat races and music."]
+```
+
+## Search one item at a time
+
+The default retrieval plugin groups matching passages by document (Record in the API).
+Three matching passages still produce one result. Hybrid scoring combines one
+keyword score with the strongest passage-vector score. It highlights that vector
+passage; lexical search highlights the passage covering the most query terms.
+Highlights come from a bounded candidate window; exceptionally long documents
+can limit passage selection.
+Custom retrieval plugins can request individual passages.
+
+New Corpora index keyword fields once per document. Existing Corpora keep their
+keyword index until you [rebuild them](/run-quivr/switch-a-vector-model).
+Configure field weights through [configureRetrieval](https://docs.quivr.thevibecompany.co/api-reference/corpora/configure-retrieval),
+which builds a replacement index and activates it when ready; a separate rebuild
+is unnecessary. Call `PUT /v0/corpora/{corpus_id}/retrieval` with `corpora:write`
+and `operations:write` on that Corpus. The linked reference describes the full
+request and the Operation returned for monitoring progress.
+
+For example (not run), these retrieval fields favor titles and add a French keyword copy of the body:
+
+```json
+{"fields": [
+  {"name": "title", "part_role": "title", "type": "string",
+   "roles": ["search"], "boost": 6},
+  {"name": "body", "part_role": "body", "type": "string",
+   "roles": ["search"], "boost": 2, "analyzer": "french_light"}
+]}
+```
+
+Weights are integers from 1 to 100. To express headline/slugline/keywords/subject
+labels/body ratios of 3/2/2/1.5/1, use 6/4/4/3/2. A Part selector collects text
+by `part_role`; `part_key_prefix` narrows it, such as `slugline-` or `paragraph-`.
+A `source_pointer` instead selects declared metadata. For a structured metadata
+array, use `type: "string_array"`; `value_pointer` selects labels from each member,
+for example `/names` (a string or array of strings).
+Use the roles, keys and metadata namespaces your normalizer emits.
+
+An `analyzer` adds a second keyword copy of a field, analyzed the same way at
+ingestion and query time. Canonical excerpts and vector input keep their original
+text. Omit it to index the field only as written. Quivr ships two analyzers:
+
+| Analyzer | What it does | Use it for |
+| --- | --- | --- |
+| `folded` | Lowercases and folds accents, ligatures and compatibility characters such as `ﬁ`, so `cafe` finds `Café`. It removes no words and stems nothing. | Any language |
+| `french_light` | Folds the same way, then removes French stopwords and lightly stems, so `election` finds `élections`. | French text |
+
+Exact and analyzed matches contribute one keyword score; hybrid search combines it
+with the strongest passage-vector score. The highlighted passage is the one with the
+most query terms under the fields' analyzers, or under `folded` when no field names one.
+
+To support another language, add an analyzer to Quivr itself:
+
+1. Add an entry to the `analyzers` list in `internal/keywords/keywords.go`: the
+   `Name` the API accepts, a `Property` suffix no other analyzer uses, and a
+   function that turns text into space-separated terms. Start from `fold` and add
+   the language's stopwords or stemmer, as `french_light.go` does.
+2. Add the name to the `analyzer` enum of `FieldMapping` in
+   `contracts/http/v0/openapi.yaml`, then run `make generate` and `make docs-site`.
+3. Add rows for the analyzer to the table in `internal/keywords/keywords_test.go`.
+
+Never change the `Property` or the output of a released analyzer: Corpora indexed
+with it would stop matching new queries until you rebuild them.
+
+You can narrow search to known identities using `filter.record_ids` and
+`filter.version_ids`, each a nonempty array of up to 50 distinct IDs. Both conditions must hold;
+a Version filter still returns only current, authorized content. Record identity
+filters require rebuilding older Corpora; otherwise search returns
+`422 metadata_filter_unavailable`.
+
+## Filter by document metadata
+
+Sources can fill the common `quivr.metadata` extension, schema version `"1"`.
+Use `filter.metadata` to compare these values across Corpora before ranking.
+Common filter names start with `metadata.`:
+
+| Fields | Value type |
+| --- | --- |
+| `language`, `source_type`, `source` | String |
+| `published_at` | RFC3339 datetime with seconds (no leap seconds) and at most nine fractional digits |
+| `author`, `subjects`, `tags`, `country`, `place` | Array of strings |
+
+Common strings are nonempty and contain at most 200 characters; common arrays
+contain at most 50 strings. Unknown source values are omitted. For example, a document without a language
+never matches a language filter. Sources retain their original metadata in their
+own extensions alongside these common fields.
+
+Each predicate names a `field` and an `any_of` array. One value means equality;
+several mean any-of equality. Array fields match any element. You can also set
+inclusive `gte` and `lte` datetime bounds. New or rebuilt indexes use a range
+index for dates. All predicates and all conditions
+inside one predicate must hold. Datetimes use UTC millisecond precision;
+submillisecond digits are truncated. Strings compare exactly, including case
+and whitespace. A request has at most 16 predicates, 50 values per predicate,
+and 200 characters per string value. Each field appears once.
+
+For example (not run), this filter combines language and publication date:
+
+```json
+{"metadata": [
+  {"field": "metadata.language", "any_of": ["en", "fr"]},
+  {"field": "metadata.published_at", "gte": "2026-01-01T00:00:00Z"}
+]}
+```
+
+Put this object in the search request's `filter`. The same conditions work in
+lexical, semantic and hybrid modes, including profiles that call other profiles.
+
+For a Corpus-specific field, declare a typed retrieval mapping with the
+`filter` role through [configureRetrieval](https://docs.quivr.thevibecompany.co/api-reference/corpora/configure-retrieval).
+The mapping becomes usable when its rebuild succeeds. Common fields are
+always declared. A requested field without the filter role excludes that
+Corpus; `excluded_corpora` lists its `corpus_id` and the missing `fields`.
+Eligible Corpora still contribute their matching documents. When every Corpus
+is excluded, the response contains an empty `items` array.
+Incompatible filter values return `422 invalid_query`.
+
+`GET /v0/records` accepts the same predicate array as JSON in the URL-encoded
+`metadata` parameter. Select one Corpus with `corpus_id`, or up to 16 with the
+comma-separated `corpus_ids` parameter, and use `order=accepted_at_desc` for
+current acceptance date order. Filtering happens before pagination. The catalog
+matches current Versions projected in the routed generation. A withdrawn
+Record can disappear from filtered pages after its projection is purged or
+rebuilt. Use the unfiltered catalog for complete resynchronization, including
+withdrawn Records. Repeat the same selection and
+predicates on every page, passing the response's `next_page_cursor` as the next
+request's `page_cursor`. Stop when `next_page_cursor` is absent.
+Metadata equality and datetime ranges use indexes scoped to the selected Corpus
+and routed generation. If the bounded read cannot complete a page, Quivr returns
+`422 filter_too_broad` with `retryable: false` and no partial page. Narrow the
+metadata or acceptance-time range before trying again.
+Changing the order, a filter, scope or routed generation returns
+`409 cursor_scope_changed`; restart the listing. Search and listing filters on
+older indexes return `422 metadata_filter_unavailable`; rebuild those Corpora
+with [rebuildCorpusProjection](https://docs.quivr.thevibecompany.co/api-reference/corpora/rebuild-corpus-projection) first.
+
+## Count values for facets
+
+`POST /v0/facets` counts documents with each metadata value in the selected
+Corpora. It needs `content:read` on every requested Corpus. Reuse the
+`filter.metadata` and `filter.source_namespaces` predicates from search; the
+acceptance-time bounds from listing work here too. The example articles above
+both declare English:
+
+{/* runnable retry */}
+```bash
+curl -s -X POST "$QUIVR_API_URL/v0/facets" \
+  -H "Authorization: Bearer $QUIVR_API_KEY" -H "Content-Type: application/json" \
+  -d @- <<EOF | jq '.items'
+{"corpus_ids": ["$CORPUS_ID"], "fields": [{"field": "metadata.language", "limit": 10}]}
+EOF
+```
+
+{/* output */}
+```json
+[{"field": "metadata.language", "buckets": [{"value": "en", "count": 2}]}]
+```
+
+Counts include only current, ready documents. Withdrawn or quarantined documents
+are excluded. Each distinct tag counts a document once; a document without a
+value contributes no bucket. Counts and search results are independent reads,
+so an update can change them between requests.
+
+Use `interval: "day"`, `"month"` or `"year"` for a date field such as
+`metadata.published_at`. Buckets start at midnight UTC and omit empty periods.
+The most frequent buckets are selected first, then dates are returned earliest
+first. Custom fields need the Corpus's `filter` mapping role; a Corpus missing
+any requested field appears in `excluded_corpora`, just as with metadata
+filters. If all selected Corpora are excluded, each requested field has empty
+`buckets`. Older indexes need a rebuild. The
+[countFacets reference](https://docs.quivr.thevibecompany.co/api-reference/facets/count-facets) lists the bounds
+and errors.
+
+Exact counts read every current document, so they slow down as a corpus grows:
+on a million documents they can take longer than the 25-second limit. Add
+`"accuracy": "fast"` when a quick answer matters more than an exact one, as in a
+filter sidebar. It is best effort: answers usually come within a few seconds,
+and the 25-second limit still applies. Quivr then says how it counted:
+
+| Response | Meaning |
+| --- | --- |
+| `as_of` | Counts stored for each Corpus, each exact when it was taken; `as_of` is the oldest of them. Quivr uses them for requests without a filter, or with only whole UTC days of the date field being counted (a timeline). A read refreshes them in the background once they are older than a minute and ten times what a refresh takes: on a million documents, about every five to ten minutes while someone reads them. A Corpus nobody reads keeps older counts, and `as_of` says how old. |
+| `approximate: true` and `sample_fraction` | Estimates scaled from that share of the Records, returned when an exact count would take more than about a second. Values that are frequent are estimated closely; rare values may be missed or off. |
+| Neither | Exact counts, as without `accuracy`. |
+
+Show estimates and stored counts as such, for example "≈ 1,200" or "counted
+4 minutes ago". If you need exact numbers, request them again without
+`accuracy`.
+
+## Cite a result
+
+Each hit carries what a citation needs:
+
+| Field | Meaning |
+| --- | --- |
+| `record_id`, `version_id` | The Record and the exact Version the passage comes from |
+| `part_key` | The Part of that Version, such as `body`, `title` or `page-3` |
+| `excerpt.text` | The passage, an exact slice of the Part's text |
+| `excerpt.start`, `excerpt.end` | Where the slice starts and ends, counted in Unicode code points |
+| `rank` | Position in this result list, 1 first |
+
+`GET /v0/records/{record_id}/versions/{version_id}` returns the whole Version, so you can show the passage in context. Every hit is re-read from storage and re-checked against the caller's access before it is returned. A search never returns a withdrawn Record, a Version that is no longer current, or a Corpus outside the key's scope; a Corpus you may not read makes the whole search fail with `403`.
+
+## Choose a profile
+
+A profile names how results are found and ranked. Each installed retrieval plugin declares profiles. The deployment maps short names such as `default` and `deep` to full names such as `core.retrieve/default`; [Search profiles](/run-quivr/search-profiles) explains the names and how one profile can re-rank another's results. With one plugin and no map, its existing short names keep working. List them:
+
+{/* runnable */}
+```bash
+curl -s "$QUIVR_API_URL/v0/search/profiles" -H "Authorization: Bearer $QUIVR_API_KEY" | jq '{names: [.items[].name]}'
+```
+
+{/* output */}
+```json
+{"names": ["default", "..."]}
+```
+
+The profile list includes `full_name`, `aliases` and `provider` for every profile.
+
+Pass a short name in `profile`. `retrieval_profile.name` echoes the name you sent, and `usage.profiles` lists the full name of each profile that ran:
+
+{/* runnable retry */}
+```bash
+curl -s -X POST "$QUIVR_API_URL/v0/search" -H "Authorization: Bearer $QUIVR_API_KEY" \
+  -H "Content-Type: application/json" -d @- <<EOF \
+  | jq -c '{asked: .retrieval_profile.name, ran: [.usage.profiles[].profile], hits: (.items | length)}'
+{"query": "ferry", "corpus_ids": ["$CORPUS_ID"], "mode": "lexical", "profile": "deep"}
+EOF
+```
+
+{/* output */}
+```json
+{"asked": "deep", "ran": ["core.retrieve/deep"], "hits": 1}
+```
+
+A full name selects a profile without the deployment's map, here the same one:
+
+{/* runnable */}
+```bash
+curl -s -X POST "$QUIVR_API_URL/v0/search" -H "Authorization: Bearer $QUIVR_API_KEY" \
+  -H "Content-Type: application/json" -d @- <<EOF \
+  | jq -c '{asked: .retrieval_profile.name, ran: [.usage.profiles[].profile], hits: (.items | length)}'
+{"query": "ferry", "corpus_ids": ["$CORPUS_ID"], "mode": "lexical", "profile": "core.retrieve/deep"}
+EOF
+```
+
+{/* output */}
+```json
+{"asked": "core.retrieve/deep", "ran": ["core.retrieve/deep"], "hits": 1}
+```
+
+These outputs come from the `make dev` stack, where `deep` maps to `core.retrieve/deep`. An unknown profile is refused with `422 unsupported_profile`.
+
+## Retry a busy search
+
+Each API process admits at most 64 active searches across callers. When capacity is full, it returns `503 search_unavailable` with `retryable: true` and a `Retry-After` header. Wait at least that many seconds before retrying, and limit concurrent searches in your client. A dependency outage can return the same code without the header; use bounded backoff for those failures. The [API overview](/api-reference/overview) describes the error envelope.
+
+If Quivr cannot encode the query because its model is unavailable or times out, it returns retryable `503 model_unavailable`. Retry with increasing delays and stop at your client's retry deadline, or try `lexical` if the profile supports it. Query length limits still return `422 query_too_long`.
+
+## Search from the command line
+
+`quivr search` sends the same request from a terminal, with the same `QUIVR_API_URL` and `QUIVR_API_KEY`:
+
+```bash
+quivr search --corpus "$CORPUS_ID" --mode lexical "ferry"
+```
+
+```text
+1 hit (profile default, version …)
+
+1. record record_…  version version_…  part body  [0,53)
+   A storm closed the harbour and cancelled every ferry.
+```
+
+Add `--json` to print the API response unchanged, and `--source` to filter by Source Namespace. The [CLI reference](/reference/cli#quivr-search) lists every flag and exit code.
+
+## When a search fails
+
+| Status | Cause |
+| --- | --- |
+| `403 forbidden` | The key may not search one of the requested Corpora. |
+| `422 query_too_long`, `422 unsupported_profile` | The query or the profile is refused. The message says why. |
+| `422 source_filter_unavailable` | The Corpus was indexed before source filtering existed; rebuild it once. |
+| `503 search_unavailable` | Search capacity is full or a dependency is unavailable. Wait for `Retry-After` when present; otherwise use bounded backoff. Quivr never answers an empty list instead. |
+| `503 model_unavailable` | The query encoding model is unavailable or timed out. Use bounded backoff, or try `lexical` if the profile supports it. |

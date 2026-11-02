@@ -1,0 +1,146 @@
+---
+title: "Reprocess quarantined documents"
+description: "Make documents a plugin refused or failed on searchable again, once the plugin is fixed or rolled back."
+keywords: ["quarantine", "reprocess", "retry", "failed documents", "plugin fix"]
+---
+
+A plugin that refuses a document, or stops while processing it, leaves its Version quarantined: Quivr keeps the document and its reason but withholds it from search. Once a fixed plugin version is active, or a rollback restored a working one, a reprocess runs those documents again and makes the ones that succeed searchable. It follows a rollback in [Upgrade or switch a plugin](/run-quivr/upgrade-a-plugin).
+
+## Prerequisites
+
+- The plan that should process the documents is active: the fixed plugin version is activated (see [Upgrade or switch a plugin](/run-quivr/upgrade-a-plugin)), or the plan was rolled back.
+- A key of the Organization that owns the Corpus with the actions `plugins:admin`, `operations:read` (to follow the reprocess) and `operations:write` (to pause, resume or cancel it), in `QUIVR_OPERATOR_KEY`.
+
+## Steps
+
+<Steps>
+<Step title="List the stuck documents">
+
+```bash
+curl -s "$QUIVR_API_URL/v0/admin/quarantine" -H "Authorization: Bearer $QUIVR_OPERATOR_KEY" \
+  | jq '.items[] | {corpus_id, version_id, stage, code: .reason.code, plugin: .reason.plugin, quarantined_at}'
+```
+
+```json
+{"corpus_id": "corpus_…", "version_id": "version_…", "stage": "ingestion", "code": "ingestion_refused", "plugin": "core.ingest", "quarantined_at": "2026-09-30T08:12:03Z"}
+```
+
+`stage` is the step that failed: `normalization` (the normalizer failed, so the document was kept as submitted) or `ingestion` (segmenting or embedding it was refused or stopped). Filter with `corpus_id`, `plugin`, `code`, `quarantined_after` and `quarantined_before`; `page_cursor` returns the next page. A document quarantined before Quivr recorded structured reasons has only its code and no `plugin`. A document whose Record got a newer revision, or was withdrawn, is not listed: it can never become current.
+
+Keep the Corpus id and the code you want to reprocess:
+
+```bash
+export CORPUS_ID=<the corpus_id above>
+```
+
+</Step>
+<Step title="Count them">
+
+A dry run is required. It counts the documents the reprocess would take, by the stage that failed and by code:
+
+```bash
+curl -s -X POST "$QUIVR_API_URL/v0/admin/quarantine/reprocess" -H "Authorization: Bearer $QUIVR_OPERATOR_KEY" \
+  -H "Content-Type: application/json" -d @- <<EOF | jq
+{"idempotency_key": "reprocess-2026-09-30", "corpus_id": "$CORPUS_ID", "code": "ingestion_refused", "dry_run": true}
+EOF
+```
+
+```json
+{"versions": 11, "stages": {"normalization": 0, "ingestion": 11}, "codes": {"ingestion_refused": 11}}
+```
+
+Leave out `code` to take every stuck document of the Corpus, or narrow with `plugin`, `quarantined_after` and `quarantined_before`.
+
+By default, reprocessing starts at the step that failed. If a fixed normalizer must replace output that ingestion refused, add `"from_stage": "normalization"` to both the dry run and the start request. Quivr reads the stored source Blob, normalizes it with the accepted plan, publishes its new Manifest, then runs ingestion. The Version keeps its identity. The dry run still groups documents by their original failed stage.
+
+Only source Blobs whose Manifest has not yet been divided into search segments can be published again. Other inputs stay quarantined and count as `skipped_not_republishable`. Use a fresh idempotency key when changing the restart stage.
+
+</Step>
+<Step title="Start it">
+
+Send the same body with `dry_run` set to `false`:
+
+```bash
+curl -s -X POST "$QUIVR_API_URL/v0/admin/quarantine/reprocess" -H "Authorization: Bearer $QUIVR_OPERATOR_KEY" \
+  -H "Content-Type: application/json" -d @- <<EOF | jq '{operation_id, state}'
+{"idempotency_key": "reprocess-2026-09-30", "corpus_id": "$CORPUS_ID", "code": "ingestion_refused", "dry_run": false}
+EOF
+```
+
+```json
+{"operation_id": "operation_…", "state": "queued"}
+```
+
+The answer is an Operation, Quivr's record of a long-running administrative task. It takes the documents in scope at this moment and runs them with the plan active now. The same key, filters and restart stage return the same Operation. Keep its id:
+
+```bash
+export OPERATION_ID=<the operation_id above>
+```
+
+</Step>
+<Step title="Follow it">
+
+```bash
+curl -s "$QUIVR_API_URL/v0/operations/$OPERATION_ID" -H "Authorization: Bearer $QUIVR_OPERATOR_KEY" | jq '{state, counters}'
+```
+
+```json
+{"state": "succeeded", "counters": {"versions_in_scope": 11, "versions_recovered": 11, "versions_quarantined": 0, "versions_skipped": 0}}
+```
+
+`versions_recovered` are searchable now. `versions_quarantined` failed again and stay quarantined with their new reason. `versions_skipped` counts the Versions it left as they were, each under `skipped_<reason>`:
+
+| Reason | Meaning |
+| --- | --- |
+| `withdrawn`, `superseded` | The Record was withdrawn, or got a newer revision, meanwhile |
+| `not_quarantined` | The document left quarantine meanwhile |
+| `canceled` | The reprocess was canceled while it processed the document, which keeps or gets back its previous reason |
+| `not_republishable` | Its normalizer succeeded, but it could not be published again; it stays quarantined |
+| `not_settled` | Its processing ended neither searchable nor quarantined; it gets back its previous reason |
+
+Pause, resume or cancel it with `POST /v0/operations/{id}/pause`, `/resume` or `/cancel`. Use `/rerun` on a finished reprocess to take what is still stuck in the same scope and preserve the restart stage, with the plan active then. Each request takes an `idempotency_key` body.
+
+</Step>
+</Steps>
+
+## Check it worked
+
+List the Corpus again: the recovered documents are gone, and those that failed again show their new reason.
+
+```bash
+curl -s "$QUIVR_API_URL/v0/admin/quarantine?corpus_id=$CORPUS_ID" -H "Authorization: Bearer $QUIVR_OPERATOR_KEY" \
+  | jq '[.items[] | {version_id, code: .reason.code, message: .reason.message}]'
+```
+
+## What a reprocess does
+
+- **Normalization stage, or `from_stage: normalization`.** The normalizer of the active plan runs again. When it answers, the document is published with the normalized content, as it would have been the first time, and processed. The change feed announces it with `record.materialized`.
+- **Ingestion stage.** The ingestion plugin of the active plan segments and embeds the document again.
+- **As a first success.** A recovered document becomes its Record's current Version if the Record still wants it, is searchable, is evaluated by the alerts of its Corpus, and appears in the change feed with `record.retrieval_ready` and `record.enrichment_available`.
+- **Pace.** It runs on the backfill queue, at most `backfill.rate` Versions per second (see [Configuration](/reference/configuration#backfill)), so live ingestion keeps its capacity. One reprocess of a Corpus runs at a time.
+- **Plan.** It is pinned to the plan active when it was accepted, like other work. Temporary plugin unavailability retries with backoff; an execution-equivalent ingestion registration can serve it. Semantic changes require the original build or a new operation using the active plan.
+- **Interruptions.** A restart resumes the document it was processing. Canceling it puts a document it had started back in quarantine with its previous reason.
+
+## Troubleshooting
+
+### Recover work stranded by an earlier plugin update
+
+Earlier engine versions could quarantine Versions with `pinned_plugin_unavailable`
+when an in-place plugin update changed its manifest digest. Upgrading prevents
+new transport or discovery outages from causing this quarantine, but does not
+release existing holds.
+
+For a stranded Corpus rebuild, cancel its Operation and wait for cancellation to
+finish. Start a new rebuild with `POST /v0/corpora/{corpus_id}/rebuilds` under the
+active plan, following [Switch a vector model](/run-quivr/switch-a-vector-model).
+Then follow the dry-run and reprocess steps above with the same Corpus id and
+`code: pinned_plugin_unavailable`. Use fresh idempotency keys and confirm that
+the rebuilt Corpus and recovered Versions are searchable.
+
+| Answer | Cause | Fix |
+| --- | --- | --- |
+| `409 dry_run_required` | No dry run recorded under this key and Corpus | Send it with `"dry_run": true` first |
+| `409 idempotency_conflict` | The key was used with another scope or restart stage | Use a new key |
+| `409 reprocess_in_progress` | Another reprocess of the Corpus has not finished | Wait for it, or cancel it |
+| `422 invalid_reprocess` | `quarantined_after` is not before `quarantined_before` | Fix the window |
+| Every document fails again with the same code | The plugin still fails, or ingestion reuses bad normalizer output | Activate the fix; for bad normalizer output, use `from_stage: normalization` in both requests with a new key |

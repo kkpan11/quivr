@@ -1,0 +1,161 @@
+---
+title: "Run a search campaign"
+description: "Explore search settings over several days, with saved results, a spending cap and recoverable cleanup."
+keywords: [search quality, evaluation, campaigns, Modal, Optuna]
+---
+
+<Note>
+Experimental: search measurement tooling may still change in a minor 2.x release. See [Versions and compatibility](/reference/compatibility#stable-and-experimental-features).
+</Note>
+
+Run a campaign to compare search settings on public development or encrypted private
+working sets over several days. It keeps the
+best quality, cost and latency trade-offs while enforcing daily and total spending
+caps. The lead submits bounded proposals and exact usage receipts; daily summaries
+go to Linear and Slack. Promotion requires trusted full-engine confirmation.
+
+## Prerequisites
+
+Use Python 3.12 and a committed Quivr checkout. Install
+`scripts/eval/requirements-campaign.txt`. Your operator supplies Modal access,
+measurement secrets, aggregate MLflow credentials and these environment variables:
+
+- `EVAL_CONTROL_DATABASE_URL`: the evaluation control PostgreSQL database.
+- `EVAL_STUDY_DATABASE_URL`: PostgreSQL for Optuna's separate `eval_optuna` schema.
+- `EVAL_CONTROL_CA_PEM` when the remote database needs a private certificate authority.
+
+Remote database URLs require `sslmode=verify-full`. A database owner applies
+`deploy/mlflow/eval-control.sql` and `deploy/mlflow/optuna.sql` first. Keep secrets
+outside campaign files. See the repository's
+[campaign guide](https://github.com/The-Vibe-Company/quivr/blob/main/docs/search-campaigns.md)
+for roles and runtime requirements.
+
+## Validate and start
+
+Copy `scripts/eval/examples/search-campaign.yaml` to an ignored operator file. Set
+an actual end date, deployment revision, opaque ticket reference and spending caps.
+The baseline is Cohere-Embed-V5-Pro, 1024 dimensions, hybrid weight 0.5.
+
+Run this validation without credentials or network:
+
+```sh
+python3 scripts/eval/search_campaign.py validate scripts/eval/examples/search-campaign.yaml
+```
+
+It prints the normalized goal, test sets, search ranges and budgets. Exploration
+accepts public development splits and private working descriptors only. It maximizes weighted nDCG@10 and minimizes
+worst-set serving cost and p95 latency. A Pareto front lists candidates whose scores
+cannot all be improved by another candidate. Gate failures remain visible but
+cannot qualify for promotion.
+
+For a private set, keep the enclosing set's `split: dev` and add its `input`
+descriptor under `policy.sets`: name, version,
+`split: working`, ciphertext digest, TREC fingerprint and `privacy: private`.
+Give eligible private sets a `goal.weights` entry. Your operator uploads only
+working ciphertext to a private Modal Volume, provisions a working age identity
+Secret and supplies `EVAL_WORKING_RUNTIME` on start and resume. Paths and keys
+stay outside the YAML. The [private working-set guide](https://github.com/The-Vibe-Company/quivr/blob/main/docs/eval-private-working.md)
+gives the upload, Secret and runtime format. Private paired statistics are computed
+inside the runner; only aggregate evidence is stored. Held-out descriptors and
+ciphertext encrypted to a separate held-out key cannot be used by tier 1.
+
+Examples requiring operator credentials and rented compute; not run during development:
+
+```sh
+python3 scripts/eval/search_campaign.py start .scratch/pilot.yaml --allow-paid
+python3 scripts/eval/search_campaign.py watchdog public-search-pilot --allow-paid
+python3 scripts/eval/search_campaign.py status public-search-pilot
+python3 scripts/eval/search_campaign.py resume public-search-pilot --allow-paid
+```
+
+`start` launches the supervisor. Run it and the watchdog as separate managed
+processes on a machine with this frozen checkout, Modal access and both databases.
+After registration, configure `resume` as the supervisor restart command. A running
+supervisor resumes automatically on the next UTC day after a daily cap; `resume`
+recovers a lost supervisor after the watchdog reconciles its compute. Terminal
+stops require a new campaign. Restart the watchdog automatically too.
+Daily exhaustion cancels compute and pauses until the next UTC day. Total caps,
+the end date and the trial limit stop the campaign. Conservative reservations
+include uncertain charges; Modal builds/storage and other account charges need
+separate budgeting. No measurements run in CI.
+
+Set `policy.reuse_campaign` to a prior campaign's identifier to reuse completed
+datasets after a stop. Keep code/scorer, baseline, prices, measurement policy and
+parallelism identical; budget caps and timeouts may differ. Source evidence stays intact.
+Modal settlement includes container execution, the startup bound and two shutdown
+seconds. Remote cache, provider and latency-window waits count; queue and client
+polling waits do not. Infrastructure restarts reserve
+another attempt. Missing receipts remain reserved, and genuine overruns stop paid work
+while preserving published dataset evidence.
+
+Each dataset compares baseline and candidate in one container, alternating fresh
+queries after both indexes and quality scores are ready. Up to `parallelism` trials
+prepare, index and score quality concurrently. Only paired fresh warmups and latency
+samples wait for an exclusive campaign-wide window; other trials continue quality work.
+Azure/Cohere requests share an adaptive limiter and 429 cooldown across containers.
+Busy trial slots wait for a later supervisor pass before paid dispatch.
+The latency gate measures local search work plus successful provider round trips.
+Retry HTTP, backoff, admission and ledger waits appear separately in
+`cost.search_timing_ms`, with wall time and the number of retried samples.
+See the [measurement guide](https://github.com/The-Vibe-Company/quivr/blob/main/docs/eval-modal.md)
+for the timing fields and replay behavior.
+
+Short network outages retry from 1 to 10 seconds for up to ten minutes. Configure
+`EVAL_NETWORK_OUTAGE_SECONDS` in the supervisor/watchdog environment (0–3600 seconds,
+default 600; 0 disables retries). Authentication/configuration refusals and uncertain
+transaction commits are not replayed. Local paid reservations pause while the Modal
+connection recovers. A detached exploration app runs independently of your machine.
+Once Modal returns a call ID, retrieval reconnects to that same call without another
+reservation or spawn. Measurements can keep progressing while only your machine is offline.
+
+Full-engine confirmations use a separate disconnect watchdog and may terminate
+after its keepalive deadline; the detached-call recovery above covers exploration.
+
+Ownership renews every ten seconds and expires after 120 seconds. The watchdog waits
+until lease expiry plus the recovery window recorded by that owner. This waiting
+period is the recovery grace: only that unreleased owner can renew during it, and
+paid work requires a current lease. Stop/release bypass grace.
+Past the retry window, the process exits unsuccessfully and the managed watchdog
+stops registered apps after grace and waits for termination acknowledgement. Lost
+app/spawn acknowledgements require that reconciliation. An app absent from a listing
+still leaves creation uncertain; an operator must resolve it with Modal before takeover.
+Uncertain charges and completed evidence stay recorded. A hard kill also waits grace.
+Adopt this behavior on the next campaign: `resume` requires its frozen checkout.
+
+## Check and stop
+
+`status` returns aggregate results, Pareto objectives, spending and held-out reads
+remaining. It exports no query IDs or raw records. `agent_token_usage: null` means
+unknown when no exact receipts have been ingested; usage is never estimated.
+Exploration does not consume held-out reads. Configure `EVAL_LINEAR_TOKEN`,
+`EVAL_SLACK_BOT_TOKEN` and `EVAL_SLACK_CHANNEL` outside the repository for daily
+summaries. The supervisor freezes one aggregate snapshot per UTC day and retries
+unacknowledged destinations. Slack timeouts can cause duplicate messages.
+See the [reporting guide](https://github.com/The-Vibe-Company/quivr/blob/main/docs/search-campaign-reporting.md)
+for proposals, receipt format and delivery recovery.
+
+Example requiring Modal and database credentials; not run during development:
+
+```sh
+python3 scripts/eval/search_campaign.py stop public-search-pilot --allow-paid
+```
+
+Stop closes paid admission and terminates only this campaign's compute. Check
+`cleanup_pending: false` before treating cleanup as complete. If termination cannot
+be acknowledged, the command returns a nonzero exit code; retry stop or let the
+managed watchdog retry. Uncertain charges and completed evidence are retained.
+SIGTERM and Ctrl-C stop the campaign; hard kills are recovered by the watchdog.
+
+## Next
+
+Configure full-stack confirmation with `--confirmation-configuration` on `start`
+or `resume`. Your operator provisions protected inputs and supplies frozen held-out
+descriptors, actual development fingerprints, production/resource settings and the
+committed engine revision. The [reporting guide](https://github.com/The-Vibe-Company/quivr/blob/main/docs/search-campaign-reporting.md#confirm-and-promote)
+gives the file format and commands. The supervisor then confirms eligible Pareto
+finalists automatically. Rejected and unavailable outcomes appear in daily summaries.
+Only confirmed results passing quality, no-loss, latency and price gates, with
+synced evidence and acknowledged cleanup, open a settings PR for human review.
+Without configuration, `confirmation_available` is false and promotion stays pending.
+The engine smoke command cannot qualify a candidate.
+[Record and compare measurements](/run-quivr/record-search-measurements).

@@ -1,0 +1,235 @@
+package postgres
+
+import (
+	"context"
+	"strings"
+
+	"github.com/The-Vibe-Company/quivr/internal/content"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// Observation locks follow canonical writer locks. The bootstrap locks
+// observations only, then reads canonical state in a fresh statement snapshot.
+// It never waits for canonical row locks, which would invert the writer lock order.
+const queueObservationKeysSQL = `SELECT DISTINCT organization,record_id FROM unnest($1::text[],$2::text[]) k(organization,record_id) ORDER BY organization,record_id OFFSET 0`
+
+// queueRecordCanonicalObservationSQL maintains one Record's canonical and
+// derived observations. Aggregate queue counters are deliberately kept out of
+// this prefix so parallel writers can commit without waiting on organization
+// stripes; the bounded reconciler runs the aggregate suffix separately.
+var queueRecordCanonicalObservationSQL = []string{
+	`INSERT INTO queue_enrichment_records(organization,record_id)
+ SELECT DISTINCT organization,record_id FROM (` + queueObservationKeysSQL + `) k ORDER BY organization,record_id
+ ON CONFLICT DO NOTHING`,
+	`SELECT q.record_id FROM (` + queueObservationKeysSQL + `) k
+ JOIN LATERAL (SELECT record_id FROM queue_enrichment_records q
+ WHERE (q.organization,q.record_id)=(k.organization,k.record_id) LIMIT 1 FOR UPDATE) q ON true`,
+	// Only current/desired Versions newly become dead on a fence. Older
+	// Versions already died on pointer changes, so observation never scans a
+	// Record's entire Version history.
+	`INSERT INTO projection_purge_candidates(organization,version_id)
+ SELECT DISTINCT q.organization,p.version_id FROM (` + queueObservationKeysSQL + `) k
+ JOIN LATERAL (SELECT * FROM queue_enrichment_records q WHERE (q.organization,q.record_id)=(k.organization,k.record_id) LIMIT 1) q ON true
+ JOIN LATERAL (SELECT current_version_id,desired_version_id,withdrawn FROM records r WHERE (r.organization,r.id)=(k.organization,k.record_id) LIMIT 1) r ON true
+ CROSS JOIN LATERAL (VALUES(q.version_id,r.current_version_id),(q.desired_version_id,r.desired_version_id),
+ (coalesce(r.current_version_id,''),r.current_version_id),(coalesce(r.desired_version_id,''),r.desired_version_id)) p(version_id,current_id)
+ WHERE p.version_id<>'' AND (p.version_id IS DISTINCT FROM p.current_id OR
+ (NOT q.gone AND (r.withdrawn OR EXISTS(SELECT FROM tombstones t WHERE (t.organization,t.record_id)=(k.organization,k.record_id)))))
+ ORDER BY q.organization,p.version_id
+ ON CONFLICT(organization,version_id) DO UPDATE SET version_id=EXCLUDED.version_id`,
+	`UPDATE queue_enrichment_records q SET
+ version_id=coalesce(r.current_version_id,''),desired_version_id=coalesce(r.desired_version_id,''),
+ gone=coalesce(r.withdrawn,true) OR EXISTS(SELECT FROM tombstones t WHERE (t.organization,t.record_id)=(q.organization,q.record_id)),
+ pending=coalesce(v.baseline_ready AND NOT v.quarantined AND v.enrichment_state IN ('queued','running','retrying') AND NOT r.withdrawn
+ AND NOT EXISTS(SELECT FROM tombstones t WHERE (t.organization,t.record_id)=(q.organization,q.record_id)),false)
+ FROM (` + queueObservationKeysSQL + `) k
+ LEFT JOIN LATERAL (SELECT current_version_id,desired_version_id,withdrawn FROM records r WHERE (r.organization,r.id)=(k.organization,k.record_id) LIMIT 1) r ON true
+ LEFT JOIN LATERAL (SELECT baseline_ready,quarantined,enrichment_state FROM record_versions v WHERE (v.organization,v.id)=(k.organization,r.current_version_id) LIMIT 1) v ON true
+ WHERE (q.organization,q.record_id)=(k.organization,k.record_id)
+ AND (q.version_id,q.desired_version_id,q.gone,q.pending) IS DISTINCT FROM (
+ coalesce(r.current_version_id,''),coalesce(r.desired_version_id,''),
+ coalesce(r.withdrawn,true) OR EXISTS(SELECT FROM tombstones t WHERE (t.organization,t.record_id)=(k.organization,k.record_id)),
+ coalesce(v.baseline_ready AND NOT v.quarantined AND v.enrichment_state IN ('queued','running','retrying') AND NOT r.withdrawn
+ AND NOT EXISTS(SELECT FROM tombstones t WHERE (t.organization,t.record_id)=(k.organization,k.record_id)),false))
+ AND q.ctid=ANY(ARRAY(SELECT locked.ctid FROM (` + queueObservationKeysSQL + `) ids
+ JOIN LATERAL (SELECT ctid FROM queue_enrichment_records p WHERE (p.organization,p.record_id)=(ids.organization,ids.record_id) LIMIT 1) locked ON true))`,
+	markObservedRecordsSQL,
+}
+
+// markParallelQueueRecordsSQL records a durable, Record-scoped revision. The
+// table is only active after the deployment-wide parallel journal cutover;
+// legacy writers retain their synchronous aggregate observations.
+const markParallelQueueRecordsSQL = `INSERT INTO parallel_queue_observations(organization,record_id,revision,changed_at,dirty_since)
+ SELECT DISTINCT organization,record_id,1,clock_timestamp(),clock_timestamp()
+ FROM unnest($1::text[],$2::text[]) keys(organization,record_id)
+ WHERE ` + parallelJournalSQL + `
+ ON CONFLICT(organization,record_id) DO UPDATE SET
+	revision=parallel_queue_observations.revision+1,changed_at=EXCLUDED.changed_at,
+ dirty_since=CASE WHEN parallel_queue_observations.revision=parallel_queue_observations.applied_revision
+ THEN EXCLUDED.dirty_since ELSE parallel_queue_observations.dirty_since END`
+
+// The normal producer suffix keeps the legacy routing/rebuild capture and the
+// parallel dirty revision in one statement. This preserves the existing batch
+// de-duplication boundary used by queueEvent while making the dirty write part
+// of the same acceptance transaction.
+const markObservedAndParallelQueueRecordsSQL = `WITH rebuild_dirty AS (` + markRebuildRecordsSQL + ` RETURNING 1),
+ routing AS (` + markRoutingRecordsSQL + ` RETURNING 1),
+ parallel AS (` + markParallelQueueRecordsSQL + ` RETURNING 1)
+ SELECT 1`
+
+// recordObservationSQL is retained as the complete two-argument observation
+// suffix for queueEvent's trailing-observation coalescing. Parallel aggregate
+// statements become no-ops through their mode predicates; the reconciler uses
+// forceParallelQueueSQL when it owns the aggregate stripes.
+var recordObservationSQL = func() []string {
+	observations := make([]string, len(queueRecordCanonicalObservationSQL))
+	copy(observations, queueRecordCanonicalObservationSQL)
+	for i, sql := range observations {
+		if sql == markObservedRecordsSQL {
+			observations[i] = markObservedAndParallelQueueRecordsSQL
+		}
+	}
+	observations = append(observations, queueRecordObservationSQL...)
+	observations = append(observations, queueRecordMetricObservationSQL...)
+	observations = append(observations, corpusRecordObservationSQL...)
+	return observations
+}()
+
+func forceParallelQueueSQL(sql string) string {
+	sql = strings.ReplaceAll(sql, "NOT "+parallelJournalSQL, "TRUE")
+	return strings.ReplaceAll(sql, "NOT mode.parallel", "TRUE")
+}
+
+func queueRecordObservations(batch *pgx.Batch, organizations, records []string) {
+	for _, sql := range recordObservationSQL {
+		batch.Queue(sql, organizations, records)
+	}
+}
+
+func queueRecordCanonicalObservations(batch *pgx.Batch, organizations, records []string, routingOnly bool) {
+	for _, sql := range queueRecordCanonicalObservationSQL {
+		if routingOnly && sql == markObservedRecordsSQL {
+			sql = markRoutingRecordsSQL
+		} else if !routingOnly && sql == markObservedRecordsSQL {
+			sql = markObservedAndParallelQueueRecordsSQL
+		}
+		batch.Queue(sql, organizations, records)
+	}
+}
+
+func queueRecordStateObservations(batch *pgx.Batch, organizations, records []string) {
+	queueRecordCanonicalObservations(batch, organizations, records, true)
+	queueRecordAggregateObservations(batch, organizations, records, false)
+	queueRecordMetricObservations(batch, organizations, records, false)
+	queueCorpusRecordObservations(batch, organizations, records)
+}
+
+func observeQueueRecords(ctx context.Context, tx pgx.Tx, organizations, records []string) error {
+	if group := journalGroupOf(ctx); group != nil {
+		for i, record := range records {
+			if organizations[i] != group.organization {
+				return content.ErrInvalid
+			}
+			group.records[record] = true
+		}
+		return nil
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	queueRecordObservations(batch, organizations, records)
+	return tx.SendBatch(ctx, batch).Close()
+}
+
+// observeQueueStateRecords refreshes queue-only changes and maintenance reads.
+// These callers do not change projection eligibility or coverage and need not
+// hold the publication fence. They must not create rebuild dirty records.
+func observeQueueStateRecords(ctx context.Context, tx pgx.Tx, organizations, records []string) error {
+	if len(records) == 0 {
+		return nil
+	}
+	var parallel bool
+	if err := tx.QueryRow(ctx, `SELECT `+parallelJournalSQL).Scan(&parallel); err != nil {
+		return err
+	}
+	if parallel {
+		return reconcileParallelQueueKeys(ctx, tx, organizations, records)
+	}
+	batch := &pgx.Batch{}
+	queueRecordStateObservations(batch, organizations, records)
+	return tx.SendBatch(ctx, batch).Close()
+}
+
+// observeRecordInBatch observes a Record after the writes already in batch,
+// without another round trip. A journal group observes each member once.
+func observeRecordInBatch(ctx context.Context, batch *pgx.Batch, org, record string) {
+	if group := journalGroupOf(ctx); group != nil {
+		group.records[record] = true
+		return
+	}
+	queueRecordObservations(batch, []string{org}, []string{record})
+}
+
+func observeQueueVersion(ctx context.Context, tx pgx.Tx, organization, version string) error {
+	var record string
+	err := tx.QueryRow(ctx, `SELECT record_id FROM record_versions WHERE organization=$1 AND id=$2`, organization, version).Scan(&record)
+	if err == pgx.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return observeQueueRecords(ctx, tx, []string{organization}, []string{record})
+}
+
+func enqueueProjectionPurge(ctx context.Context, tx pgx.Tx, organization, version string) error {
+	_, err := tx.Exec(ctx, `INSERT INTO projection_purge_candidates(organization,version_id)
+ VALUES($1,$2) ON CONFLICT(organization,version_id) DO UPDATE SET version_id=EXCLUDED.version_id`, organization, version)
+	return err
+}
+
+// The bootstrap observes records written before observation existed, in
+// bounded keyset passes. Writers maintain observations themselves, so once a
+// pass reaches the end the bootstrap is done and never scans records again.
+func advanceQueueObservations(ctx context.Context, tx pgx.Tx, limit int) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO queue_enrichment_bootstrap(singleton) VALUES(true) ON CONFLICT DO NOTHING`); err != nil {
+		return err
+	}
+	var organization, record string
+	var initialized bool
+	if err := tx.QueryRow(ctx, `SELECT organization,record_id,initialized FROM queue_enrichment_bootstrap WHERE singleton FOR UPDATE`).Scan(&organization, &record, &initialized); err != nil {
+		return err
+	}
+	if initialized {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT organization,id FROM records WHERE (organization,id)>($1,$2) ORDER BY organization,id LIMIT $3`, organization, record, limit)
+	if err != nil {
+		return err
+	}
+	var organizations, records []string
+	for rows.Next() {
+		if err = rows.Scan(&organization, &record); err != nil {
+			rows.Close()
+			return err
+		}
+		organizations = append(organizations, organization)
+		records = append(records, record)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	if err = observeQueueStateRecords(ctx, tx, organizations, records); err != nil {
+		return err
+	}
+	if len(records) < limit {
+		initialized = true
+		organization = ""
+		record = ""
+	}
+	_, err = tx.Exec(ctx, `UPDATE queue_enrichment_bootstrap SET organization=$1,record_id=$2,initialized=$3 WHERE singleton`, organization, record, initialized)
+	return err
+}

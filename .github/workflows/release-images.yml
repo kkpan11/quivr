@@ -1,0 +1,239 @@
+name: Release images
+'on':
+  release:
+    types:
+    - published
+concurrency:
+  group: release-images
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  verification:
+    if: startsWith(github.event.release.tag_name, 'v2.')
+    uses: ./.github/workflows/verify.yml
+    with:
+      ref: ${{ github.event.release.tag_name }}
+  prepare:
+    if: startsWith(github.event.release.tag_name, 'v2.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.release.outputs.matrix }}
+      version: ${{ steps.release.outputs.version }}
+      revision: ${{ steps.release.outputs.revision }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.event.release.tag_name }}
+        persist-credentials: false
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+      with:
+        python-version: 3.12.16
+    - run: python3 scripts/ci_fetch.py -- pip install --require-hashes -r scripts/ci-requirements-base.txt
+    - uses: ./.github/actions/grype-database
+    - id: release
+      env:
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
+      run: |
+        python3 scripts/release_images.py --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" > release.json
+        jq -r '"version=\(.version)", "matrix=\(.matrix|tojson)"' release.json >> "$GITHUB_OUTPUT"
+        echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+    needs:
+    - verification
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    # Allow the pinned source build; signing retains its separate five-minute cap.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      GRYPE_DB_AUTO_UPDATE: false
+      GRYPE_DB_VALIDATE_AGE: true
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ needs.prepare.outputs.revision }}
+        persist-credentials: false
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+    - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+      id: image
+      with:
+        context: .
+        file: ${{ matrix.file }}
+        target: ${{ matrix.target }}
+        platforms: linux/amd64
+        outputs: type=image,name=${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+        build-args: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          REVISION=${{ needs.prepare.outputs.revision }}
+          PLUGIN=${{ matrix.plugin }}
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+          org.opencontainers.image.revision=${{ needs.prepare.outputs.revision }}
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+      with:
+        python-version: 3.12.16
+    - name: Prepare the pinned E5 tokenizer fixture
+      if: matrix.plugin == 'hosted-embed'
+      run: python3 scripts/prepare_tokenizer.py
+    - name: Check the published runtime before signing
+      env:
+        IMAGE: ${{ matrix.image }}@${{ steps.image.outputs.digest }}
+        PLUGIN: ${{ matrix.plugin }}
+        PLUGIN_ID: ${{ matrix.plugin_id }}
+        COMPONENT: ${{ matrix.component }}
+        VERSION: ${{ needs.prepare.outputs.version }}
+        REVISION: ${{ needs.prepare.outputs.revision }}
+      run: python3 scripts/image_smoke.py "$IMAGE" --plugin "$PLUGIN" --plugin-id "$PLUGIN_ID" --component "$COMPONENT" --version "$VERSION" --revision "$REVISION"
+    - name: Install checksum-verified inventory and scan tools
+      env:
+        TOOLS_DIR: ${{ runner.temp }}/security-tools
+      run: |
+        bash scripts/security_tools.sh syft "$TOOLS_DIR"
+        bash scripts/security_tools.sh grype "$TOOLS_DIR"
+        echo "$TOOLS_DIR" >> "$GITHUB_PATH"
+    - name: Inventory the immutable image
+      env:
+        IMAGE: ${{ matrix.image }}@${{ steps.image.outputs.digest }}
+        SBOM: sboms/${{ matrix.component && format('quivr-{0}', matrix.component) || matrix.plugin_id && format('quivr-plugin-{0}', matrix.plugin_id) || 'quivr' }}.spdx.json
+        SYFT_CHECK_FOR_APP_UPDATE: false
+      run: |
+        mkdir -p sboms
+        syft "registry:$IMAGE" --output "spdx-json=$SBOM"
+    - uses: ./.github/actions/grype-database-restore
+    - name: Reject critical vulnerabilities with an available fix
+      env:
+        IMAGE: ${{ matrix.image }}@${{ steps.image.outputs.digest }}
+        GRYPE_CHECK_FOR_APP_UPDATE: false
+      run: bash scripts/scan_image.sh "registry:$IMAGE"
+    - name: Pack bounded scan failure evidence
+      if: failure()
+      run: python3 scripts/ci_artifacts.py vulnerabilities.json scan-report.txt --output "${{ runner.temp }}/failure.tar.gz"
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      if: failure()
+      with:
+        name: vulnerabilities-${{ matrix.component || matrix.plugin || 'engine' }}
+        path: ${{ runner.temp }}/failure.tar.gz
+        if-no-files-found: warn
+        retention-days: 3
+        compression-level: 0
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      with:
+        go-version-file: tools/cosign/go.mod
+        cache-dependency-path: tools/cosign/go.sum
+    - name: Build checksum-verified Cosign with existing-entry recovery
+      timeout-minutes: 10
+      run: |
+        bash scripts/install_cosign.sh "$RUNNER_TEMP/signing-tools"
+        echo "$RUNNER_TEMP/signing-tools" >> "$GITHUB_PATH"
+    - name: Sign, attest and verify the immutable image
+      timeout-minutes: 5
+      env:
+        IMAGE: ${{ matrix.image }}@${{ steps.image.outputs.digest }}
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
+        SBOM: sboms/${{ matrix.component && format('quivr-{0}', matrix.component) || matrix.plugin_id && format('quivr-plugin-{0}', matrix.plugin_id) || 'quivr' }}.spdx.json
+      run: |
+        export COSIGN_CERTIFICATE_IDENTITY="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/release-images.yml@refs/tags/$RELEASE_TAG"
+        bash scripts/sign_image.sh "$IMAGE" "$SBOM"
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: sbom-${{ matrix.component || matrix.plugin || 'engine' }}
+        path: sboms/
+        if-no-files-found: error
+    - name: Record the signed image
+      env:
+        IMAGE: ${{ matrix.image }}@${{ steps.image.outputs.digest }}
+      run: |
+        mkdir -p signed-images
+        image_name="${IMAGE%%@*}"
+        printf '%s\n' "$IMAGE" > "signed-images/${image_name##*/}.txt"
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: image-${{ matrix.component || matrix.plugin || 'engine' }}
+        path: signed-images/
+  deployment-smoke:
+    needs: [prepare, build]
+    uses: ./.github/workflows/verify-single-machine.yml
+    with:
+      ref: ${{ needs.prepare.outputs.revision }}
+      version: ${{ needs.prepare.outputs.version }}
+      mode: published
+  publish:
+    needs:
+    - prepare
+    - build
+    - deployment-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: write
+    steps:
+    # Check out first: checkout cleans the workspace and would delete the downloaded artifacts.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ needs.prepare.outputs.revision }}
+        persist-credentials: false
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        pattern: image-*
+        merge-multiple: true
+        path: signed-images
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        pattern: sbom-*
+        merge-multiple: true
+        path: sboms
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+    - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Advance the rolling tag only after every image passes and is signed
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
+        VERSION: ${{ needs.prepare.outputs.version }}
+        REVISION: ${{ needs.prepare.outputs.revision }}
+      run: |
+        cat signed-images/*.txt | sort > images.txt
+        python3 scripts/single_machine_bundle.py --images signed-images --output .scratch/compose-bundle --version "$VERSION" --revision "$REVISION"
+        gh release upload "$RELEASE_TAG" ".scratch/quivr-compose-$VERSION.tar.gz" --repo "$GITHUB_REPOSITORY" --clobber
+        # Rerunning an older release must not move the rolling alias backwards.
+        # Stable releases advance `latest`; the 2.0.0 alphas advanced `latest-alpha`.
+        gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" | jq 'add // []' > releases.json
+        newest=$(python3 scripts/release_scan.py newest --candidate "$RELEASE_TAG" < releases.json)
+        case "$VERSION" in *-*) alias=latest-alpha ;; *) alias=latest ;; esac
+        gh release upload "$RELEASE_TAG" sboms/*.spdx.json --repo "$GITHUB_REPOSITORY" --clobber
+        gh release upload "$RELEASE_TAG" images.txt --repo "$GITHUB_REPOSITORY" --clobber
+        gh api "repos/$GITHUB_REPOSITORY/contents/CHANGELOG.md?ref=$RELEASE_TAG" --jq .content | base64 --decode > CHANGELOG.md
+        gh release upload "$RELEASE_TAG" CHANGELOG.md --repo "$GITHUB_REPOSITORY" --clobber
+        while IFS= read -r image; do
+          docker buildx imagetools create --prefer-index=false \
+            --tag "${image%@*}:$VERSION" --tag "${image%@*}:sha-$REVISION" "$image"
+        done < images.txt
+        if [ "$newest" = "$RELEASE_TAG" ]; then
+          while IFS= read -r image; do
+            docker buildx imagetools create --prefer-index=false --tag "${image%@*}:$alias" "$image"
+          done < images.txt
+        fi
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
+  PIP_CONSTRAINT: ${{ github.workspace }}/scripts/ci-constraints.txt
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  PIP_RETRIES: '0'
+  npm_config_fetch_retries: '0'

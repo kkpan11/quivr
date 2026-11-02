@@ -1,0 +1,168 @@
+{
+  "compatibility": {
+    "engine": ">=0.1.0 <0.3.0",
+    "plugin_api": ">=0.18.0 <0.19.0"
+  },
+  "configuration": {
+    "execution_keys": [
+      "tokenizer_processes",
+      "max_concurrent_requests",
+      "batch_size",
+      "max_batch_tokens",
+      "request_timeout_ms",
+      "call_budget_ms",
+      "batch_wait_ms",
+      "max_retries"
+    ],
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "auth": {
+          "const": "none"
+        },
+        "base_url": {
+          "const": "http://127.0.0.1:8080/v1"
+        },
+        "batch_size": {
+          "const": 16
+        },
+        "batch_wait_ms": {
+          "const": 25
+        },
+        "body_tokens": {
+          "const": 512
+        },
+        "call_budget_ms": {
+          "const": 30000
+        },
+        "dimensions": {
+          "const": 384
+        },
+        "document_prefix": {
+          "const": "passage: "
+        },
+        "document_template": {
+          "const": "{prefix}{text}"
+        },
+        "format": {
+          "const": "openai"
+        },
+        "max_batch_tokens": {
+          "const": 8192
+        },
+        "max_chunks": {
+          "const": 4
+        },
+        "max_concurrent_requests": {
+          "const": 4
+        },
+        "max_retries": {
+          "const": 2
+        },
+        "max_tokens_per_segment": {
+          "const": 512
+        },
+        "metric": {
+          "const": "cosine"
+        },
+        "model": {
+          "const": "intfloat/multilingual-e5-small"
+        },
+        "model_revision": {
+          "const": "1"
+        },
+        "plugin_id": {
+          "const": "hosted.embed"
+        },
+        "plugin_version": {
+          "const": "1.2.0"
+        },
+        "query_prefix": {
+          "const": "query: "
+        },
+        "query_template": {
+          "const": "{prefix}{query}"
+        },
+        "rebalance_tail": {
+          "const": true
+        },
+        "request_timeout_ms": {
+          "const": 4000
+        },
+        "send_dimensions": {
+          "const": false
+        },
+        "tail_min_fraction": {
+          "const": 0.25
+        },
+        "title_context_parts": {
+          "enum": [
+            null,
+            []
+          ]
+        },
+        "title_source": {
+          "const": "title"
+        },
+        "tokenizer": {
+          "const": null
+        },
+        "tokenizer_processes": {
+          "const": 0
+        },
+        "usd_per_million_tokens": {
+          "const": null
+        }
+      },
+      "required": [
+        "format",
+        "base_url",
+        "auth",
+        "model",
+        "dimensions"
+      ],
+      "type": "object"
+    }
+  },
+  "contributions": {
+    "ingestion": {
+      "limits": {
+        "max_segments": 256
+      },
+      "paging": true,
+      "query_timeout_ms": 10000,
+      "spaces": {
+        "hosted.embed.intfloat-multilingual-e5-sma-384-32096b91c08ed286": {
+          "dimensions": 384,
+          "indexes": [
+            "text"
+          ],
+          "metric": "cosine",
+          "model": "intfloat/multilingual-e5-small",
+          "query_modalities": [
+            "text"
+          ],
+          "version": "1"
+        }
+      },
+      "timeout_ms": 120000
+    }
+  },
+  "description": "Text passages embedded with a configured hosted or OpenAI-compatible model.",
+  "id": "hosted.embed",
+  "run": {
+    "command": [
+      "go",
+      "run",
+      "."
+    ]
+  },
+  "secrets": [
+    {
+      "description": "Provider key from the plugin environment; required by bearer and api-key authentication. Never put it in configuration.",
+      "name": "EMBED_API_KEY",
+      "required": false
+    }
+  ],
+  "version": "1.2.0"
+}

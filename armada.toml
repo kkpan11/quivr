@@ -1,0 +1,98 @@
+# Armada configuration: one project = one repository + one tracker program root.
+# No secrets here: keys come from the environment or `armada auth login`.
+
+[project]
+name = "Quivr V2"
+slug = "quivr-v2"          # stable id: lowercase letters, digits and dashes
+
+[tracker]
+program_root = "THE-531"  # Linear issue at the root of the program
+language = "en"          # language of owner-facing output
+ready_label = "ready-for-agent"
+
+[tracker.labels]
+phase_group = "Agent phase"
+runtime_group = "Agent runtime"
+runtimes = ["Claude Code", "Codex", "Conductor"]
+
+[github]
+repository = "The-Vibe-Company/quivr"
+
+[gates]
+# required_checks = ["test"]  # CI checks that must be green before a hand-back (default: every check)
+
+[policy]
+silence_minutes = 15     # a worker with no report for longer than this shows as silent
+
+# How `armada brief` launches workers on Conductor. Every value is passed explicitly;
+# `conductor model` lists each agent's model ids and effort levels.
+[conductor]
+default_profile = "codex"   # backend work runs on Sol; tickets labelled Frontend run on Opus
+
+[conductor.profiles.opus]
+agent = "claude"
+model = "opus-5-5-1m"
+effort = "high"
+
+[conductor.profiles.codex]
+agent = "codex"
+model = "gpt-6.1-sol"
+effort = "high"
+
+[[conductor.routing]]
+labels = ["Frontend"]
+profile = "opus"
+
+# How `armada launch --runtime herdr` starts workers on this machine (local fallback when Conductor is unavailable).
+[herdr]
+default_profile = "codex"
+
+[herdr.profiles.codex]
+harness = "codex"
+model = "gpt-6.1-sol"
+effort = "high"
+permissions = "full"
+extra_args = ["-c", "check_for_update_on_startup=false", "-c", "service_tier=\"default\""] # never fast/priority mode (Stan, 2026-10-06)
+
+[herdr.profiles.claude]
+harness = "claude"
+model = "opus" # CLI alias; Conductor ids such as opus-5-5-1m are unknown to the local CLI
+effort = "high"
+permissions = "full"
+
+# Known flaky failures: `armada ci why <pr> --rerun` reruns them once. Each needs its root-cause ticket.
+[[ci.known_failure]]
+check = "verify demo"
+pattern = "admin-health-live\\.spec\\.ts:16"
+ticket = "THE-1207"
+
+# Railway demo services. Railway only redeploys a service when a merge touches its
+# watch paths, so each target lists the same paths. Each coordinator machine sets
+# RAILWAY_LINK_DIR (a directory linked to the demo project) with
+# `armada config set deploy.env.RAILWAY_LINK_DIR <path>`.
+[[deploy.target]]
+name = "railway-api"
+branch = "main"
+live_sha_command = "cd \"${RAILWAY_LINK_DIR:?set RAILWAY_LINK_DIR}\" && set -o pipefail && railway deployment list --service api --limit 20 --json | jq -er '[.[]|select(.status==\"SUCCESS\")][0].meta.commitHash'"
+paths = ["go.mod", "go.sum", "cmd/**", "internal/**", "client/**", "migrations/**", "contracts/**", "scripts/prepare_tokenizer.py", "scripts/token_offsets.py", "third_party/tokenizer/**", "sdks/**", "plugins/**", "deploy/railway/core.Dockerfile", "deploy/railway/core-entrypoint.py"]
+timeout_minutes = 30
+requires_env = ["RAILWAY_LINK_DIR"]
+pause_on_failure = true
+
+[[deploy.target]]
+name = "railway-worker"
+branch = "main"
+live_sha_command = "cd \"${RAILWAY_LINK_DIR:?set RAILWAY_LINK_DIR}\" && set -o pipefail && railway deployment list --service worker --limit 20 --json | jq -er '[.[]|select(.status==\"SUCCESS\")][0].meta.commitHash'"
+paths = ["go.mod", "go.sum", "cmd/**", "internal/**", "client/**", "migrations/**", "contracts/**", "scripts/prepare_tokenizer.py", "scripts/token_offsets.py", "third_party/tokenizer/**", "sdks/**", "plugins/**", "deploy/railway/core.Dockerfile", "deploy/railway/core-entrypoint.py"]
+timeout_minutes = 30
+requires_env = ["RAILWAY_LINK_DIR"]
+pause_on_failure = true
+
+[[deploy.target]]
+name = "railway-web"
+branch = "main"
+live_sha_command = "cd \"${RAILWAY_LINK_DIR:?set RAILWAY_LINK_DIR}\" && set -o pipefail && railway deployment list --service web --limit 20 --json | jq -er '[.[]|select(.status==\"SUCCESS\")][0].meta.commitHash'"
+paths = ["quivr-search/**", "deploy/railway/web.Dockerfile"]
+timeout_minutes = 20
+requires_env = ["RAILWAY_LINK_DIR"]
+pause_on_failure = true

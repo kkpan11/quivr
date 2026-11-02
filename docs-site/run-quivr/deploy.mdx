@@ -1,0 +1,384 @@
+---
+title: "Deploy and configure Quivr"
+sidebarTitle: "Deploy and configure"
+description: "What a Quivr deployment runs, the order to start it in, and how to check that it is ready."
+keywords: ["deploy", "QUIVR_CONFIG", "migrate", "readiness", "probes", "self-host"]
+---
+
+A Quivr deployment runs one `quivr` binary as three commands, next to four services and the plugins you choose. Every process reads the same JSON configuration file; you run `quivr migrate` first, then keep `quivr api` and `quivr worker` running.
+
+For an image-only evaluation installation, follow [Run Quivr on one machine](/run-quivr/single-machine). It packages the API, worker, plugins and dependencies in one Compose file.
+
+## What a deployment runs
+
+| Part | What it does |
+| --- | --- |
+| `quivr api` | Serves the public HTTP API that applications call |
+| `quivr worker` | Runs the background work: processes content, pulls connectors, delivers alerts and events |
+| `quivr migrate` | Prepares PostgreSQL, object storage and the search index, then exits |
+| PostgreSQL | Stores Quivr's state: documents and their versions, alerts, operations and the change feed |
+| Temporal | Schedules and retries the worker's background work |
+| Weaviate | The search index |
+| S3-compatible storage | Original files and the artifacts derived from them |
+| Plugins | Separate HTTP services that read files, cut and embed passages, rank results and judge alerts |
+
+`make dev` runs all of these on one machine, with the service versions pinned in [`deploy/compose/compose.yaml`](https://github.com/The-Vibe-Company/quivr/blob/main/deploy/compose/compose.yaml). The [Quickstart](/quickstart) walks through it.
+
+## Choose shared dependency settings
+
+Compose and Railway resolve PostgreSQL, Weaviate and autoscaler settings from the
+[shared infrastructure declaration](https://github.com/The-Vibe-Company/quivr/blob/main/deploy/infrastructure.md).
+The `small` profile is the conservative starting point. The opt-in `large` profile gives
+PostgreSQL, Weaviate, API and live/bulk workers 32,000,000,000 bytes and 32 vCPUs on a
+PaaS; its autoscaler stays at 134,217,728 bytes and 0.25 vCPU. It enables Weaviate
+`ASYNC_INDEXING=true`, 1024 MiB memtables, 27 GiB `GOMEMLIMIT` and a 3,600-second
+bootstrap timeout. These are unbenchmarked starting values: async writes can precede
+vector visibility, and memtable memory grows across active buckets and shards. `GOMEMLIMIT`
+is a soft budget around 80–90% of service memory, not an RSS cap.
+
+Large PostgreSQL and Weaviate storage planning budgets are 500,000,000,000 bytes each;
+PostgreSQL derives `QUIVR_POSTGRES_VOLUME_MB=476837` unless overridden. Capacity checks
+report the filesystem minimum and do not resize volumes or verify shared filesystem quotas.
+
+For local development, `make dev` reads `QUIVR_INFRASTRUCTURE_PROFILE` and
+`QUIVR_INFRASTRUCTURE_OVERRIDES` and writes an ignored Compose overlay, including on
+macOS. Compose manages PostgreSQL and Weaviate; API and worker processes stay native
+host processes. For example:
+
+```sh
+export QUIVR_INFRASTRUCTURE_PROFILE=large
+make dev
+```
+
+To render the same overlay for a direct Compose launch, append it after the base file:
+
+```sh
+python3 deploy/infrastructure.py render --profile large \
+  --output .scratch/infrastructure.json
+docker compose -f deploy/compose/compose.yaml \
+  -f .scratch/infrastructure.json config
+```
+
+Direct Compose requires `QUIVR_DB_PASSWORD`, `QUIVR_LOCAL_ROOT` (with `s3.json`)
+and `QUIVR_MODEL_ROOT` (the prepared model directory). `make dev` supplies them.
+
+Applying or redeploying volume-backed PostgreSQL or Weaviate can interrupt requests; schedule
+maintenance and verify readiness before continuing.
+
+The [deployment settings guide](https://github.com/The-Vibe-Company/quivr/blob/main/deploy/infrastructure.md)
+covers Railway `preview`, `apply`, `initialize-monitoring` and `check`, including the
+`match`, `drift` and `unknown` exit statuses. Small Railway defaults to PostgreSQL and
+Weaviate; large also applies limits to API, live worker and bulk worker. Without an
+explicit `--service`, an existing uniquely named autoscaler is included automatically;
+it is never created or replica-reset. Apply stages settings and resource limits without
+resetting existing replica counts; for PostgreSQL it selects
+`deploy/railway/postgres.Dockerfile` and clears the Railway image source. For an existing
+installation, run `railway up --project ID --environment ID --service POSTGRES_SERVICE_ID --detach`
+from the repository root; a newly provisioned installation can use the deploy helper. This
+selection changes no replica count. For large, redeploy Weaviate and each changed API, worker,
+worker-bulk and, if present, autoscaler with the explicit commands in the shared guide; existing
+replica counts remain unchanged. Then initialize monitoring and check active values;
+startup command-line settings take precedence over existing `ALTER SYSTEM` values after restart.
+
+## The configuration file
+
+`QUIVR_CONFIG` holds the path of a JSON file. Give `api`, `worker` and `migrate` the same file, except for addresses such as `probe_listen`. It must set:
+
+- `database_url`, `temporal_address`, `weaviate_url` and `s3`: where the four services are;
+- `cursor_key`: a stable secret of at least 32 bytes that signs change-feed cursors;
+- `keys`: the API keys and what each may do. You create keys here; give `plugins:admin` only to operator keys;
+- `plugins`: at least one ingestion plugin and one retrieval plugin, normally the first-party `core.ingest` and `core.retrieve`. The `api` refuses to start without both, and the `worker` without an ingestion plugin. `core.ingest` also needs a Text Embeddings Inference server for its model; see [First-party plugins](/run-quivr/catalog#core-ingest).
+
+The file holds the database URL, storage credentials and API keys, so keep it readable only by Quivr's processes. The [Configuration reference](/reference/configuration) lists every field, and [Pin a plugin](/run-quivr/pin) shows how to add one.
+
+[Choose an embedding model](/run-quivr/choose-an-embedding-model) before pinning inference. For historical collection, follow [Run a large import](/run-quivr/run-a-large-import) to budget PostgreSQL, Weaviate and provider capacity, select bulk workers and monitor backlog.
+
+A change to this file takes effect when the processes restart. Plugin changes made through the API, such as activating a new version, apply while Quivr runs; see [Upgrade or switch a plugin](/run-quivr/upgrade-a-plugin).
+
+## Pull and verify a release image
+
+Release images use `2.X.Y` versions, such as `2.0.0`, and run on `linux/amd64`. The [GitHub releases](https://github.com/The-Vibe-Company/quivr/releases) contain release-please's changelog and an `images.txt` file listing signed image digests. A digest identifies the exact image bytes; copy the engine entry beginning `ghcr.io/the-vibe-company/quivr@`. Docker and [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) must be installed.
+
+For example, not run; replace both placeholders with values from the same release:
+
+```sh
+set -e
+export VERSION='<release version, without v>'
+export IMAGE='ghcr.io/the-vibe-company/quivr@sha256:<digest from images.txt>'
+export WORKFLOW='https://github.com/The-Vibe-Company/quivr/.github/workflows/release-images.yml'
+cosign verify "$IMAGE" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity "$WORKFLOW@refs/tags/v$VERSION"
+docker pull "$IMAGE"
+docker run --rm --read-only --tmpfs /tmp "$IMAGE" --version
+```
+
+Verification checks the digest, GitHub's OIDC issuer and the exact release workflow identity. A failed verification stops deployment. The version command prints the release version and full commit. `latest` is a moving tag that follows the newest 2.x release; use a verified digest to keep a deployment fixed. Every image also has `<version>` and `sha-<full commit>` tags.
+
+See [Security of Quivr releases](/run-quivr/security) for the signed component inventory and vulnerability checks.
+
+## Run the image
+
+Put the configuration in `config.json`, readable by UID/GID `10001`, the image's non-root user. Set `listen` to `0.0.0.0:8080` and `probe_listen` to `0.0.0.0:8081` so container ports can reach them. Put the four services and plugins on a Docker network named `quivr`; their hostnames in the file must resolve on that network. Keep probes reachable only by your operator tools.
+
+On a Linux host, `sudo chown 10001:10001 config.json` and `sudo chmod 600 config.json` give that user sole access. Create the network with `docker network create quivr` if it does not exist, then attach your services to it.
+
+`QUIVR_CONFIG` selects the mounted file by environment variable. It does not map arbitrary environment variables to JSON fields. To supply secrets from your platform, render a protected configuration file before starting the containers. Leave `log_directory` unset to keep logs on the process output stream. The root filesystem can be read-only; `/tmp` is the declared writable temporary directory. A configured file-log directory needs its own writable mount.
+
+Plugins negotiating Plugin API `0.14.0` require [signed engine requests](/reference/plugin-protocol#signed-engine-requests). Older manifest ranges keep working unsigned, with an engine startup warning. Provision a separate key ring for each plugin using that reference's format. Put the complete plugin-id-to-ring map in `QUIVR_ENGINE_PLUGIN_KEYS` for both API and worker; give each plugin only its own ring in `QUIVR_PLUGIN_SIGNING_KEYS`. These are dedicated environment secrets, separate from the JSON configuration and cosign image signatures.
+
+The examples below use Docker environment files: `engine-signing.env` contains the engine variable, and `push-source-signing.env` contains only that plugin's variable with the matching ring. Create an equivalent file for each other plugin negotiating signed calls. Protect these host files with `chmod 600`, or inject the variables with your platform's secret manager. Never send the engine's complete map to a plugin or bake keys into an image.
+
+For example, not run; this needs your services and configuration. Run migration first, then use the same image and file for separate API and worker containers:
+
+```sh
+docker run --rm --read-only --tmpfs /tmp --network quivr \
+  -e QUIVR_CONFIG=/etc/quivr/config.json \
+  --mount type=bind,src="$PWD/config.json",dst=/etc/quivr/config.json,readonly \
+  "$IMAGE" migrate
+docker run -d --name quivr-api --read-only --tmpfs /tmp --network quivr \
+  --env-file engine-signing.env \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
+  -e QUIVR_CONFIG=/etc/quivr/config.json \
+  --mount type=bind,src="$PWD/config.json",dst=/etc/quivr/config.json,readonly \
+  "$IMAGE" api
+docker run -d --name quivr-worker --read-only --tmpfs /tmp --network quivr \
+  --env-file engine-signing.env \
+  -p 127.0.0.1:8082:8081 -e QUIVR_CONFIG=/etc/quivr/config.json \
+  --mount type=bind,src="$PWD/config.json",dst=/etc/quivr/config.json,readonly \
+  "$IMAGE" worker
+```
+
+Stop these processes with `docker stop --time 60 quivr-api quivr-worker`, allowing the default shutdown budget. Increase that timeout if you configure a longer `shutdown_grace`. Then remove their containers with `docker rm quivr-api quivr-worker`. This leaves the external services and their data in place.
+
+### Run first-party plugin images
+
+Each plugin image is `ghcr.io/the-vibe-company/quivr-plugin-<id>`, where `<id>` is its exact manifest id: for example `core.ingest`, `core.retrieve`, `alerts`, `pdf-text` or `connector.rss`. Plugin images share the engine release tags and signing identity. Verify each digest from `images.txt` with the same cosign command.
+
+The bundled `core.ingest` manifest negotiates an older API and its calls remain unsigned. Supplying a signing key does not change that negotiated API. For example, not run; substitute a verified release digest:
+
+```sh
+docker run -d --name core-ingest --read-only --tmpfs /tmp --network quivr \
+  'ghcr.io/the-vibe-company/quivr-plugin-core.ingest@sha256:<digest>'
+```
+
+The bundled `push-source` manifest admits signed calls and needs its matching ring. For example, not run; substitute its verified digest:
+
+```sh
+docker run -d --name push-source --read-only --tmpfs /tmp --network quivr \
+  --env-file push-source-signing.env \
+  'ghcr.io/the-vibe-company/quivr-plugin-push-source@sha256:<digest>'
+```
+
+Plugins listen on port `8080`, bind to `0.0.0.0`, and serve their exact manifest from `/app/quivr-plugin.yaml`. The engine image includes matching manifests under `/usr/share/quivr/plugins/<directory>/quivr-plugin.yaml`; for `core.ingest`, use the directory `core-ingest`. Pin its endpoint as `http://core-ingest:8080`. Its tokenizer configuration uses `python: /app/.scratch/tokenizer/venv/bin/python` and `model: /app/.scratch/tokenizer/tokenizer.json`, paths inside the plugin container. Configure its `tei_url` to reach your inference server. [First-party plugins](/run-quivr/catalog) lists the other plugin ids and their dependencies.
+
+For example, not run; this is one entry in the file's `plugins` list, alongside a retrieval plugin:
+
+```json
+{
+  "manifest": "/usr/share/quivr/plugins/core-ingest/quivr-plugin.yaml",
+  "endpoint": "http://core-ingest:8080",
+  "configuration": {
+    "tei_url": "http://tei:80",
+    "tokenizer": {
+      "python": "/app/.scratch/tokenizer/venv/bin/python",
+      "model": "/app/.scratch/tokenizer/tokenizer.json"
+    }
+  }
+}
+```
+
+The `hosted.embed` image requires a manifest generated for your model configuration. Run its `configure` command with the configuration mounted read-only and save its stdout as `quivr-plugin.yaml`. Mount that file at `/app/quivr-plugin.yaml` in the serving container and pin those same bytes in the engine; see [Hosted embeddings](/run-quivr/catalog#hosted-embed). Provider keys go in the plugin's environment, as its manifest declares. Stop and remove plugin containers when you remove the deployment.
+
+## Start order
+
+For example, not run:
+
+```bash
+export QUIVR_CONFIG=/etc/quivr/config.json
+quivr migrate   # exits when done
+quivr api       # in its own process
+quivr worker    # in its own process
+```
+
+1. `quivr migrate` updates the database schema, creates the storage bucket when it is missing, and prepares the search index. It gives up after 30 seconds when storage or the search index does not answer; run it again once they do.
+2. `quivr api` refuses to start while required expansions are pending; run `quivr migrate` first. Deferred contracts do not block startup.
+3. `quivr worker` started before the expansions waits for them for up to `migration_wait` (5 minutes by default), then exits.
+
+To deploy a new `quivr` binary, run its `quivr migrate` first, then roll `api` and `worker` on it. Missing required expansions prevent startup; older binaries can start on compatible expanded schemas. Applying contracts ends rollback support. See [Upgrade Quivr](/run-quivr/upgrade-quivr) for the upgrade order and rollback window. The [CLI reference](/reference/cli#engine-commands) lists the commands' exit codes.
+
+## Check that it is ready
+
+Each `api` and `worker` serves three probes on its `probe_listen` address, `127.0.0.1:8081` by default. Give each process its own address, and keep it private. The probes open only once startup is done: a `worker` still waiting for migrations answers none of them, so give a liveness check at least `migration_wait` before it restarts the process.
+
+| Probe | Answer |
+| --- | --- |
+| `GET /healthz` | `204` once the process has started |
+| `GET /readyz` | `204` once the process can serve, `503` otherwise |
+| `GET /metrics` | Counters and gauges in Prometheus text format |
+
+Both processes expose HTTP request counts by registered route, method and status class, request durations in seconds, and requests in flight. Templates replace path identifiers; unknown paths use `unmatched` and unknown methods use `OTHER`. Streams remain in flight until they close. The private probes are included, so a scrape itself occupies one in-flight request.
+
+The API also exposes its search admission capacity, occupied and available slots, and capacity refusals. Each process exposes its PostgreSQL pool's maximum, total, acquired (currently borrowed by work) and idle connections and saturation ratio (acquired divided by maximum). These are local to the process, reset when it restarts, and remain readable without new dependency calls even when backlog reads fail. Scrape every replica to see its own pressure. Prometheus metrics are available with OpenTelemetry export disabled; enabling export sends the same measurements to the collector.
+
+`GET /v0/version` accepts any valid bearer API key and reports the running release, commit, API version and plugin engine compatibility version. Both process startup logs include these fields; `/metrics` includes `quivr_build_info{version="…",revision="…"} 1`. The distribution release is independent of the API (`v0`) and plugin engine compatibility (`0.2.0`) versions.
+
+The `api` becomes ready once its schema check passes and its ingestion plugin has answered a first query, or after 5 seconds; the first searches are then only slower. The `worker` also checks that Temporal, object storage and the search index answer. A plugin that is down does not stop either process. Background work that needs it waits and retries. An unavailable or timed-out query encoder returns retryable `503 model_unavailable`; query validation and length refusals keep their `422` codes, including `query_too_long`. Another unavailable search dependency returns retryable `503 search_unavailable`.
+
+## Route logs and stop a process
+
+Engine logs are JSON lines on stdout. Set `log_level` or `QUIVR_LOG_LEVEL` to `debug`, `info`, `warn` or `error`; the default is `info`. Set `instance` and `environment`, or their `QUIVR_INSTANCE` and `QUIVR_ENVIRONMENT` overrides, to identify the process in your log tooling. [Logs and shutdown](/reference/configuration#logs-and-shutdown) lists the event fields and redaction behavior. `log_directory` optionally keeps rotating local copies.
+
+Stop a process with SIGTERM or SIGINT. Its `/readyz` becomes `503` first, then it drains admitted requests and background work. `shutdown_grace` defaults to `60s`; set your platform's termination timeout long enough to allow that budget. The stable lifecycle events are `quivr.start`, `quivr.ready`, `quivr.draining` and `quivr.stop`. A readiness event means the process passed its readiness criteria, including the API’s query warm-up timeout described above; a start event alone does not.
+
+## Follow a request across services
+
+Set `telemetry.endpoint` to your OpenTelemetry collector in the API and worker configuration, then restart both. The [OpenTelemetry reference](/reference/configuration#opentelemetry) lists HTTP/gRPC, authentication headers and sampling settings. Search your collector by the response’s `X-Trace-ID`, or the `trace_id` in a JSON error or log line. The trace continues through durable background work and outgoing plugin and webhook requests.
+
+Keep `/metrics` scraping as it is: metric names and buckets remain unchanged. Each plugin process needs its own exporter configuration to send its internal spans to the collector.
+
+### Diagnose slow searches during imports
+
+Run the same query in `lexical`, `semantic` and `hybrid` modes while content is being imported. Use a key with `search:query` permission; [Search](/guides/search) shows the request. Successful responses report `usage.phases.index_query_ms`, which includes index requests, response decoding and passage selection in the API.
+
+For a slow request, use its `X-Trace-ID` to inspect the `weaviate.request` spans in your collector. These spans end at response headers; body transfer and decoding still contribute to `index_query_ms`. Compare their durations and count with the whole search. Many fast index requests can still consume the search deadline. A later direct replay against Weaviate cannot attribute the original request's delay.
+
+Lexical search fetches one sorted window of at most 2,400 passage objects per candidate round. A full window ends the scan. For a smaller window, it allows one refill with twice as many candidate documents as the first round, capped at 2,400 candidates. Each window has a 16 MiB response limit. If it exceeds that limit, search makes one recovery request for a single passage and ends the scan. These bounds also apply to the lexical part of hybrid search; unusually long documents or many candidate documents without passages from the selected ingestion plugin can leave fewer candidates than requested. Hitting these bounds can omit matching documents and change hybrid result order. Compare latency and completed ingestion throughput before changing Weaviate indexing settings or adding shards.
+
+## Scale workers on backlog
+
+Run separate `quivr worker` processes with `worker.queues: ["live"]` and `["bulk"]`; choose each process's slots using [Worker queues](/reference/configuration#worker-queues). Replicas keep no durable local work: PostgreSQL and Temporal own claims, progress and retries. Use the same database, Temporal namespace, storage, signing keys and active plugin plan. Give processes distinct probe addresses on a shared host, or separate network namespaces. Plugin endpoints may point to shared services or sidecars in each process's network namespace; each sidecar needs its own lifecycle and writable temporary directory. A shared embedding provider still needs enough capacity for both classes.
+
+`GET /v0/admin/queues` accepts a bearer API key granted `queues:read` with all-corpus scope (`corpora: ["*"]`); configure it under [API keys](/reference/configuration#api-keys). Its numeric paths stay stable, including `queues.bulk.waiting` and `queues.live.waiting`. Observations refresh every 15 seconds by default; configure `queue_observation.refresh_interval` in all processes for an interval from 1 to 60 seconds. Rebuild/backfill waiting counts use scope and progress counters and may count overlapping bulk work more than once; use them as a scaling signal. See [Worker queues](/reference/configuration#worker-queues) for freshness and estimation details. For example, not run:
+
+```json
+{"queues":{"live":{"waiting":0,"in_progress":1,"oldest_waiting_age_seconds":0},"bulk":{"waiting":123,"in_progress":2,"oldest_waiting_age_seconds":45}}}
+```
+
+Proportional scaling uses one queue's waiting count:
+
+```text
+replicas = clamp(ceil(waiting / documents_per_replica), min, max)
+```
+
+Scale-up needs no stabilization window; scale-down goes only to the highest recommendation of the last five minutes, which reduces short-lived scale-downs around a threshold. With 20,000 waiting documents per replica, the proportional rule requests two workers at 20,001 documents. Choose the target from measured document throughput and your provider's capacity. Keep at least one bulk worker so admitted work continues when waiting reaches zero. Counts are installation-wide, so a request to any healthy API replica is enough.
+
+Bulk connectors stop fetching new pages at 1,000 waiting ingestion documents. The built-in `quivr-autoscaler` shares that bound and requests at least one more bulk worker whenever total waiting reaches it, up to the configured maximum. Total waiting includes ingestion and downstream work. Sustained saturation therefore adds workers even while connector prefetch is paused. The connector still stops at its bound when workers reach the maximum; an already fetched page and concurrent connectors can overshoot it. More workers may not increase throughput when the database or another dependency is saturated.
+
+Create a dedicated key for the scaler with only `queues:read` and `corpora: ["*"]`, distinct from the API and operator keys, under [API keys](/reference/configuration#api-keys). Never give a scaler the operator key.
+
+### Kubernetes with KEDA
+
+Use KEDA when it is installed. Create a Deployment named `quivr-bulk` running `quivr worker` with `worker.queues: ["bulk"]`. Mount its configuration and supply plugin secrets as for any worker. Put the dedicated `queues:read` key in the `token` entry of a Secret named `quivr-queue-reader`, and give KEDA HTTPS access to the API service.
+
+For example, not run; substitute your API service URL:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: quivr-queue-reader
+spec:
+  secretTargetRef:
+    - parameter: token
+      name: quivr-queue-reader
+      key: token
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: quivr-bulk
+spec:
+  scaleTargetRef:
+    name: quivr-bulk
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  pollingInterval: 30
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+  triggers:
+    - type: metrics-api
+      metadata:
+        url: https://quivr-api.example.org/v0/admin/queues
+        format: json
+        valueLocation: queues.bulk.waiting
+        targetValue: "20000"
+        authMode: bearer
+      authenticationRef:
+        name: quivr-queue-reader
+```
+
+KEDA's [metrics-api scaler](https://keda.sh/docs/2.20/scalers/metrics-api/) reads that numeric path and sends the Secret as `Authorization: Bearer …`. HPA stabilization controls scale-down between positive replica counts; KEDA's `cooldownPeriod` applies to scaling to zero. HPA tolerance can change exact decisions near a threshold. Set the Deployment's termination grace period longer than Quivr's `shutdown_grace`.
+
+KEDA applies only the proportional rule. For connector imports, choose a target low enough to reach your maximum before the 1,000-document prefetch bound (for example, `targetValue: "125"` for eight replicas), or use the built-in controller below. Apply the same choice to the Prometheus `threshold` if you use that trigger.
+
+Alternatively, scrape Quivr's private probe endpoint `/metrics` and replace the trigger with KEDA's [Prometheus scaler](https://keda.sh/docs/2.20/scalers/prometheus/) on `quivr_queue_waiting_documents`. The example `job` selector must identify only this Quivr installation. `max` avoids adding the same database count once per scraped replica. Configure Prometheus authentication separately when required.
+
+For example, not run:
+
+```yaml
+triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc:9090
+      query: max(quivr_queue_waiting_documents{queue="bulk",job="quivr"})
+      threshold: "20000"
+      ignoreNullValues: "false"
+```
+
+The same gauges expose `in_progress` and `oldest_waiting_age_seconds` for dashboards and saturation alerts. A shared PostgreSQL snapshot keeps scrapes independent of operation size. Processes refresh it in the background at most once per configured interval (15 seconds by default), with a 30-second refresh budget; counts describe the last completed observation. The queue API returns 503 for a missing snapshot or one older than the larger of one minute and twice the configured interval. Metrics instead omit unavailable queue series and continue serving other families. Set `ignoreNullValues: "false"` so the Prometheus scaler treats an empty result as an error instead of zero backlog.
+
+### The quivr-autoscaler binary
+
+<Note>
+Experimental: `quivr-autoscaler` may still change in a minor 2.x release. See [Versions and compatibility](/reference/compatibility#stable-and-experimental-features).
+</Note>
+
+Where KEDA is not available, run `quivr-autoscaler`: one small, always-on process that polls the queue endpoint and sets one worker service's replica count. Build it from the repository root with `cmd/quivr-autoscaler/Dockerfile`. Run exactly one per target, with no other scaler on it. `QUIVR_AUTOSCALER_BACKEND` selects how replicas are read and set:
+
+- `kubernetes` patches the `/scale` subresource of a Deployment in the autoscaler pod's own namespace, as the pod's service account. Grant that account `get` and `patch` on `deployments/scale` for the target only, for example with a Role whose rule is `{apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["quivr-bulk"], verbs: ["get", "patch"]}`.
+- `railway` updates a Railway service's replica count. The [Railway guide](https://github.com/The-Vibe-Company/quivr/blob/main/deploy/railway/autoscaler/README.md) covers its project token and service setup.
+
+| Variable | Default / meaning |
+| --- | --- |
+| `QUIVR_AUTOSCALER_BACKEND` | Required: `kubernetes` or `railway`. Any other value stops the process. |
+| `QUIVR_QUEUE_URL` | Required: the full queue endpoint, for example `http://quivr-api:8080/v0/admin/queues`; use HTTPS outside a private network |
+| `QUIVR_QUEUE_KEY` | Required secret: the dedicated `queues:read` key |
+| `QUIVR_AUTOSCALER_QUEUE` | `bulk`; the queue whose waiting count drives the target, `bulk` or `live` |
+| `QUIVR_AUTOSCALER_KUBERNETES_DEPLOYMENT` | Required for `kubernetes`: the Deployment to scale |
+| `RAILWAY_TOKEN`, `QUIVR_AUTOSCALER_RAILWAY_SERVICE_ID`, `RAILWAY_ENVIRONMENT_ID` | Required for `railway` only; the service ID is the target, not the autoscaler's own `RAILWAY_SERVICE_ID` |
+| `QUIVR_AUTOSCALER_ENABLED` | `true`; `false` exits without reading APIs or changing replicas |
+| `QUIVR_AUTOSCALER_MIN` / `QUIVR_AUTOSCALER_MAX` | `1` / `8` replicas |
+| `QUIVR_AUTOSCALER_DOCUMENTS_PER_REPLICA` | `20000` waiting documents per replica for the proportional rule; bulk saturation can request more |
+| `QUIVR_AUTOSCALER_DOWNSCALE_WINDOW` | `5m`; the highest recent recommendation limits scale-down; `0s` disables stabilization |
+| `QUIVR_AUTOSCALER_MIN_SCALE_INTERVAL` | `2m` between successful scale actions; `0s` disables spacing |
+| `QUIVR_AUTOSCALER_INTERVAL` | `30s` delay after each poll, at least `1s` |
+| `QUIVR_AUTOSCALER_REQUEST_TIMEOUT` | `10s` per HTTP request, at least `1s` |
+
+The process logs JSON lines: `autoscaler started` with its backend and queue, then one `autoscaling decision` per poll with `waiting`, the observed `current` count, the recommended `target`, the acknowledged `applied` count and an `outcome`: `hold`, `cooldown`, `scaled`, or an error stage. An unknown count is `-1`. A `hold` with a lower backlog can be the stabilization window; `cooldown` means the minimum scale interval has not elapsed. It reads the backend's replica count on every poll and never assumes a failed write succeeded. Startup, failed reads or writes and replica changes made by someone else restart the stabilization window at the observed count. Missing or malformed counts and `503` responses are errors, never zero backlog.
+
+For `bulk`, the target is the larger of the proportional recommendation and `current + 1` when waiting is at least 1,000, clamped to the replica bounds. Repeated successful actions reach the maximum while saturation persists; `QUIVR_AUTOSCALER_MIN_SCALE_INTERVAL` still spaces them. For `live`, only the proportional rule applies. Both queues retain downscale stabilization.
+
+### Scale by hand
+
+On a platform without a replica API, or to size workers before automating, read `queues.bulk.waiting` or the `quivr_queue_waiting_documents` gauge, apply the rule above and set the worker count yourself.
+
+For the capacity model, dependency budgets and incident checks behind these scaling decisions, read [Scale Quivr](/run-quivr/scale-quivr).
+
+## Example deployments
+
+- **Local:** `make dev`, in the [Quickstart](/quickstart).
+- **Hosted, single node:** the repository's [Railway example](https://github.com/The-Vibe-Company/quivr/blob/main/deploy/railway/README.md) runs the demo app and Quivr with separate live/bulk workers and an optional [autoscaler service](https://github.com/The-Vibe-Company/quivr/blob/main/deploy/railway/autoscaler/README.md), without high availability.
+
+## Next
+
+- [Run Quivr behind TLS](/run-quivr/tls) to terminate incoming HTTPS and configure outgoing certificate verification.
+
+- [Pin a plugin](/run-quivr/pin) to add plugins to your deployment.
+- [Operate a Quivr deployment](/run-quivr/overview) for the other operator tasks.
+
+For a rolling application upgrade and the database rollback window, follow
+[Upgrade Quivr](/run-quivr/upgrade-quivr).

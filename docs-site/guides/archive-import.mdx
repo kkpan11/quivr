@@ -1,0 +1,258 @@
+---
+title: "Import archives"
+description: "Import immutable tar.gz and ZIP members from object storage, with checkpoints and source revision ordering."
+---
+
+Use the `object_storage_archive` connector to import individual members of
+`.tar.gz` and `.zip` objects under an S3-compatible prefix. Each matching member
+becomes a raw source Blob, the immutable bytes Quivr normalizes into a document.
+
+## Before you start
+
+You need a running Quivr with the `connector.object_storage_archive` plugin
+pinned. Version 1.1 requires Plugin API 0.19; earlier engines should retain
+the earlier plugin version. External processes require [engine call signing](/reference/plugin-protocol#signed-engine-requests);
+local and packaged launchers provision the signing ring automatically. Local stacks and the packaged worker include it. For an external
+plugin process, [pin its manifest and endpoint](/run-quivr/pin).
+
+Create a [Corpus](/guides/add-content), the collection that will hold the
+imported documents. Your API key needs `connectors:write`, `connectors:read`
+and access to that Corpus. A storage reader needs `ListBucket` on the prefix
+and `GetObject` on its archives. Temporary credentials also need their session
+token. A normalizer must support the configured media type: for XML, pin a
+normalizer with the matching XML route before importing.
+
+Keep the source objects immutable. Archives are visited in lexicographic
+object-key order. New keys must sort after the highest archive key already selected by the connector, including an in-progress archive. Use a
+separate Connector Instance, a scheduled source reader, to import earlier
+keys or a different historical range.
+
+## Choose the member identity
+
+A Record Key groups revisions of the same document. A Source Position is its
+non-negative numeric revision number; Quivr keeps the highest position current,
+even if an older version arrives later.
+
+By default, the key is the URL-decoded basename and the position is the
+matching-member ordinal across archives. **The ordinal default is correct only
+when archive order equals revision order.** A basename that includes a revision
+suffix also needs a key capture to group those revisions into one document.
+
+For example, these synthetic paths carry version 12 before version 3:
+
+```text
+2026/01/01/10/urn%3Aexample%3AITEM7-12.xml
+2026/01/02/11/urn%3Aexample%3AITEM7-3.xml
+```
+
+Use `record_key_pattern: "urn:example:([A-Z0-9]+)-"` and
+`source_position_pattern: "-([0-9]+)\\.xml$"`. The connector URL-decodes the
+path first, so the first capture sees `urn:example:ITEM7-12.xml` and yields
+`ITEM7`. The second yields `12` or `3`. Both revisions remain available;
+revision 12 stays current after importing the later folder.
+
+Each pattern is a Go regular expression with exactly one capture group.
+Every matched member must produce a nonempty key and a position containing
+only decimal digits. Encode a literal percent sign as `%25`; decoding is strict so identity captures cannot silently switch to a different path representation. A malformed URL escape or invalid capture stops the page
+before it can advance its checkpoint. Instance configuration is fixed: disable
+the failed instance and create one with a corrected mapping or member filter.
+Keep the same Corpus and `source_namespace` when the Record Key mapping remains
+the same; a new instance rereads the prefix. Changing keys creates different
+Records, so withdraw any previously accepted incorrect identities separately.
+Revisions of one Record may share a page and are submitted in archive order,
+with at most one revision of each key in flight. Only different keys run
+concurrently; a later older position still cannot replace a higher current position.
+
+## Configure and start the source
+
+Use the [connector creation and credential workflow](/guides/connectors#create-an-instance)
+with kind `object_storage_archive`. Set `work_queue: "bulk"` at the creation
+request's top level, alongside `kind`, `config` and `schedule`, so this historical
+import uses bulk workers. For example, these are request fields, outside `config`:
+
+```json
+{"kind":"object_storage_archive","work_queue":"bulk"}
+```
+
+Put the storage settings below in `config`.
+This is an example for your own storage; replace the bucket, prefix and region:
+
+```json
+{
+  "bucket": "example-archives",
+  "prefix": "inbox/",
+  "region": "us-east-1",
+  "archive_patterns": ["**/*.tar.gz", "**/*.zip"],
+  "member_pattern": "**/*.xml",
+  "media_type": "application/xml",
+  "record_key_pattern": "urn:example:([A-Z0-9]+)-",
+  "source_position_pattern": "-([0-9]+)\\.xml$",
+  "batch_size": 100,
+  "concurrency": 8
+}
+```
+
+Set `endpoint` to an HTTP or HTTPS origin for an S3-compatible store.
+Omit it for AWS S3. Globs match the raw object key or member path; `*` stays
+within one directory, `**` spans directories, and `?` matches one character.
+Archive patterns default to both supported archive types; the member pattern
+defaults to `**`. Directories and links are excluded.
+
+Deposit `access_key_id`, `secret_access_key` and, when needed, `session_token`
+in the credential's `secret` object. These fields are write-only and never
+returned by the API. The plugin uses deposited credentials exclusively.
+Keep these values out of source control and shell history.
+
+`batch_size` accepts 1–1000 matching members, default 100. The page cache also
+caps the batch at 64 MiB. `concurrency` accepts 1–32 distinct Record submissions,
+default 1. Increase it only after measuring database and storage headroom on
+your installation; pages remain sequential. Each member must contain 1 byte to 25 MiB of uncompressed data.
+An empty or larger matched member stops the page with a source error.
+
+## Read progress and resume
+
+Read the Connector Instance's health as shown in [Check collection](/guides/connectors#watch-its-health).
+Its diagnostics report:
+
+| Field | Meaning |
+| --- | --- |
+| `archive`, `member_offset` | Current object key and next archive entry |
+| `members_done` | Matching members processed across the prefix |
+| `archive_members_done` | Matching members processed in the current archive |
+| `members_left` | Remaining matching members in the ZIP archive, or across the prefix when `members_total` is supplied; unknown (`null`) for an unfinished tar.gz without a configured total |
+| `compressed_bytes_read`, `object_size_bytes` | Compressed source bytes read and current object size |
+| `progress_percent` | Compressed byte reads divided by object size, capped at 100; buffered or repeated ranged reads can reach 100 before every member is submitted |
+| `archive_complete` | All members of the current archive were traversed |
+| `page_items`, `page_bytes` | Matching members returned and their total uncompressed bytes |
+| `page_cut` | Why the archive reader ended this page; values below |
+| `acquisition` | Engine timing for this committed page; fields below |
+
+For a page from the current archive, `page_cut` is `batch_size`, `page_bytes`,
+or `archive_end`. These mean the requested item count, the 64 MiB
+page byte bound, or the end of that archive. Repeated Record Keys do not cut a page.
+The ZIP reader's 1 MiB read window bounds buffering; it does not limit page bytes.
+
+`acquisition.items` counts page members. `fetch_ms` is elapsed fetch time,
+including the engine's lease/archive admission and its release. `grant_ms`, `upload_ms`, `verify_ms`, `accept_ms`,
+`receipt_ms` and `describe_ms` sum time across workers for upload grants,
+plugin uploads, stored-byte verification, durable submission, replay checks
+and attachment descriptions. These sums overlap when submissions run in
+parallel; compare them with `page_ms` (elapsed fetch and submission time),
+rather than adding them to estimate elapsed time. Upload time includes the
+plugin's invocation, source/cache access, spooling and PUT. `run_ms` is elapsed
+time since the run began acquiring pages. Times are milliseconds.
+
+`more` reports whether acquisition can continue. `stop_reason` is empty for
+an intermediate page, or `source_drained`, `page_limit`, `soft_limit` or
+`attachment_budget` for the last page. Failed or interrupted page logs use
+`incomplete`; intentionally skipped or inactive runs emit no page diagnostic. Runs remain bounded to ten pages, two
+minutes before starting another page, and a 200 MiB attachment budget.
+`acquisition.stop_reason: page_limit` means the run reached ten pages;
+use `page_cut` to explain the size of an individual archive page.
+
+`continuation: true` means the engine requests another durable leased run
+immediately after a successful bounded run. The final page must report `more: true` and advance the checkpoint from both this page's input and the run's starting
+value.
+Replayed items and pages containing only filtered entries can advance this cursor
+without creating new versions. Unchanged checkpoints, source exhaustion, errors, notices and permanent
+item rejections keep the configured interval; `RetryAfter` and healthy push
+can make that wait longer. Each continuation has a new run sequence and remains
+in the same work queue. Dispatch and processing capacity still govern its pace.
+
+Before each bulk fetch, the engine checks the ingestion-only waiting count in
+the shared queue snapshot. At 1,000 waiting documents, acquisition defers to
+its interval until processing catches up. This count deduplicates pending
+receipts and documents awaiting baseline processing; active ingestion attempts,
+post-baseline enrichment, rebuilds and other operations do not contribute.
+Missing or stale observations also defer bulk acquisition. Live connectors
+continue polling independently. Snapshot refresh lag and concurrent pages can
+overshoot this watermark; it bounds prefetching rather than setting an import
+size limit.
+
+`acquisition.continuation_reason` explains a false continuation: `run_in_progress`,
+`source_drained`, `checkpoint_stalled`, `checkpoint_cycled`, `source_notice`,
+`item_rejected`, `store_unsupported` or `incomplete`. An empty value accompanies a requested
+continuation. A deferral before the next fetch logs `connector run deferred`
+with `continuation_reason: ingestion_backpressure` or `queue_unavailable`;
+it keeps the last committed page diagnostic and checkpoint. A run that defers
+before fetching its first page does not count as a successful source poll.
+
+`interval_ms` reports the configured wait used when continuation is false.
+For those runs, estimate scheduled idle share as
+`interval_ms / (run_ms + interval_ms)`; a continuation has no configured wait.
+Logs and successive committed pages show any additional dispatch delay.
+
+Diagnostics capture timing before checkpoint persistence. The `connector
+acquisition page` log includes that persistence in elapsed page/run time and
+reports a soft limit crossed during the commit. That crossing can also change
+`continuation` from false in the stored snapshot to true in the committed log;
+use the log's post-commit decision when classifying how the run ended. An incomplete page is logged
+without advancing its checkpoint. If kind diagnostics are omitted or null,
+already use `acquisition`, or adding timing would exceed the 16 KiB diagnostics
+bound, the engine preserves their existing behavior and reports timings in the
+log only.
+
+For a known total across the prefix, set optional `members_total`. Tar archives
+are never scanned once just to count members. ZIP's directory supplies its
+matching-member count. ZIP directories are bounded to 4 MiB and 100,000 entries before parsing; use tar.gz for larger member sets. ZIP member reads retain one 1 MiB range window. A percentage measures source reading, while
+`members_done` measures committed ingestion progress, including permanent
+rejections reported as `item_rejected` in health. Accepted members can still
+be waiting for normalization or search publication; acceptance does not mean
+searchability.
+
+Use [pause and resume](/guides/connectors#pause-and-resume-collection) to stop
+collection and continue from its last saved checkpoint. Pause also stops
+continuing imports. A source request already in progress may finish, but cannot
+save a later checkpoint after pause; already accepted documents keep processing.
+Resume makes collection due immediately unless the source's `Retry-After` delays it.
+A manual run while paused is refused; permanent disable cannot be resumed.
+The checkpoint records the archive ETag and member
+offset. After a worker or plugin restart, the connector scans the compressed
+tar stream to that offset and continues. ZIP uses ranged member reads.
+Escape-heavy archive identities retain compact refs to fit the 1,024-byte
+protocol bound; recovering out-of-order uploads of those refs can require
+more than one gzip prefix scan.
+A small page cache accelerates upload grants; recovery also works when that
+cache is gone. Repeated submissions converge on idempotent receipts.
+
+Replacing an in-progress source archive reports `archive_changed`; deleting
+it reports `archive_missing`. Restore the original object with its original ETag
+and request another run, or disable it
+and create another for the replacement immutable source. Identical bytes alone
+may produce a different ETag. Credential failures show as access errors.
+Invalid identity captures and malformed archives show as source errors;
+retryable storage failures retain the last committed checkpoint.
+
+## Measure throughput
+
+On a running local demo or development stack, run `make measure-archive`
+with its stack name, as described in the plugin's
+[package README](https://github.com/The-Vibe-Company/quivr/blob/main/plugins/object-storage-archive/README.md).
+The measurement seeds synthetic source objects and reports accepted members
+per second against the 50 members/second acquisition target. It also reports
+searchable and enriched unique Records per second, stage rollups, worker service
+durations and hardware metadata. It waits for enrichment before finishing.
+Organization-wide rollups need an otherwise idle Organization; document timeline
+intervals include queue waits. Synthetic text uses built-in normalization.
+It is outside CI.
+
+To measure hosted embedding without calling a paid provider, use the loopback
+fake on the same local stack:
+
+```bash
+make measure-archive args='--hosted-fake --stack demo --items 5000 --batch-size 500 --concurrency 32 --provider-latency-ms 500'
+```
+
+The command temporarily pins `hosted.embed`, then restores the stack configuration
+and processes. It records provider batch sizes and latency alongside the archive
+measurement under `.scratch/demo/`. Compare with `--batch-wait-ms 0` to disable
+cross-Version batching, keeping hardware, source settings and fake latency equal.
+The default 25 ms collection window groups document inputs from the same
+Organization within provider item and token limits; query embedding bypasses it.
+The ingestion worker admits four processing batch activities with up to 16
+receipts each, or 64 receipts per process. Each receipt keeps its pinned plan,
+stage deadlines and replay guards. Provider concurrency remains separately
+bounded by `max_concurrent_requests`. Add worker replicas only within your
+database and provider capacity.
+See [Run a large import](/run-quivr/run-a-large-import) for storage sizing,
+provider capacity and queue monitoring, and [hosted embedding settings](/run-quivr/switch-a-vector-model).

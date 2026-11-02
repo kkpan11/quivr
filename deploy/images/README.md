@@ -1,0 +1,79 @@
+# Release images
+
+Release-please opens a release pull request on `main` from Conventional Commit
+messages (the repository's squash-merged Commitizen PR titles). The coordinator
+merges it when a release is wanted. Its version file, manifest, changelog, tag
+and GitHub prerelease all belong to one distribution release. Workers never
+merge release pull requests or create release tags.
+
+## Configure release automation
+
+Set the repository Actions secret `RELEASE_PLEASE_TOKEN` to a fine-grained PAT
+or GitHub App token with Contents, Issues and Pull requests write access to this
+repository. Run this locally as the repository administrator. This example was
+not run in this workspace and is not part of release automation:
+
+```sh
+gh secret set RELEASE_PLEASE_TOKEN --repo The-Vibe-Company/quivr
+```
+
+The command prompts for the value; never put it in a file tracked by Git.
+`GITHUB_TOKEN` cannot replace it: events it creates do not trigger the release
+PR's CI or the image workflow. See the [release-please credential guidance](https://github.com/googleapis/release-please-action#other-actions-on-release-please-prs).
+For an expiring App token, use `actions/create-github-app-token` in the release
+workflow and pass its output to release-please instead of the PAT secret.
+
+`release-please-config.json` selects the simple release type with default
+versioning. `.release-please-manifest.json` and `version.txt` hold the current
+release, `2.0.0` onwards: features bump the minor version and fixes the patch
+version. The `2.0.0-alpha.N` pre-releases came before 2.0.0.
+`bootstrap-sha` excludes history before this distribution release series.
+The plugin engine compatibility version remains `0.2.0`, and the API remains
+`v0`; these contracts are independent of the distribution version.
+
+## Publish a release
+
+Merging the release PR causes release-please to publish its GitHub release.
+Only that `release: published` event runs `.github/workflows/release-images.yml`.
+The workflow refuses a tag outside `v2.X.Y` (or an old `v2.0.0-alpha.N`) or a version that differs
+from the checked-out manifest and `version.txt`. It:
+
+1. Discovers first-party plugin manifests and their Go or Python runtimes.
+2. Builds `linux/amd64` images and pushes only their immutable digests.
+3. Checks the real images as UID/GID 10001 with a read-only root and `/tmp` tmpfs.
+   Plugin discovery uses an ephemeral signing key injected only at runtime.
+4. Generates a Syft SPDX SBOM and rejects Grype critical findings with an available fix.
+5. Signs and verifies each digest and its SBOM attestation with cosign/GitHub OIDC.
+6. Runs the anonymous, image-only Compose smoke for both CPU models, then attaches the
+   `quivr-compose-VERSION.tar.gz` bundle, per-image `*.spdx.json` SBOMs, `images.txt` (signed digests) and release-please's `CHANGELOG.md` to
+   the existing release. Its release notes already contain the changelog.
+7. Creates version/full `sha-<commit>` tags and advances `latest` without
+   changing the signed digests. Older reruns do not move that alias backwards.
+   The 2.0.0 alphas advanced `latest-alpha` instead.
+
+Rolling aliases update separately for each package; registries cannot promote
+multiple packages atomically. Deploy a shared release by its version or the
+signed digests in `images.txt`, rather than combining `latest` tags.
+
+GHCR package names use manifest ids: `quivr` for the engine and
+`quivr-plugin-<id>` for each plugin. For example, `quivr-plugin-core.ingest`
+and `quivr-plugin-connector.rss`. Set each new GHCR package's visibility to
+public in its package settings after the first publication; GHCR initially
+creates private packages. The Compose release also creates `quivr-core`, `quivr-web`,
+`quivr-cpu-embeddings`, `quivr-postgres`, `quivr-seaweed` and `quivr-tei`.
+On their first release, make all six public before rerunning the failed
+`deployment-smoke` job and its publish dependency. Its anonymous pull is the
+operator-access gate; authenticating that smoke would conceal a private package. The image source label links them to this repository.
+
+The engine uses `quivr.Dockerfile`; plugin targets are `go-plugin`,
+`python-plugin`, `core-ingest` and `hosted-embed` in `plugin.Dockerfile`.
+`core-ingest` includes its pinned model tokenizer; `hosted-embed` includes the
+hash-pinned Python tokenizer runtime and accepts a read-only model-file mount.
+Linux arm64 is not published: its tokenizer wheel
+lock is not defined yet. Runtime images contain no compiler or package installer.
+The runtime smoke script also serves as a local check for a built image.
+
+Operator pulling, configuration and signature commands live in
+[Deploy and configure Quivr](https://docs.quivr.thevibecompany.co/run-quivr/deploy).
+[Release security](https://docs.quivr.thevibecompany.co/run-quivr/security) covers SBOM verification,
+nightly scans and private reporting. The Railway image switch is separate.

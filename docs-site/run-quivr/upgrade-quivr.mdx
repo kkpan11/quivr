@@ -1,0 +1,156 @@
+---
+title: "Upgrade Quivr and keep a rollback window"
+description: "Apply compatible schema changes, roll the API and worker, and defer destructive cleanup."
+keywords: [upgrade, migration, rollback, deployment]
+---
+Apply the new version's additive database changes while the previous API and worker keep running. Keep destructive cleanup deferred until you no longer need application rollback.
+
+## Prerequisites
+
+You need operator access to the deployment, the new and previous binaries, and their configuration files. Keep the previous configuration and plugin versions available. Your platform must run overlapping instances and route traffic to ready instances; Quivr does not provide the rollout controller.
+
+Read the release notes for required backfills and contract migrations. Check that the release supports an in-place upgrade from your current version before starting. If it does not, reset the installation or export data with the old installation and re-import it into a fresh one.
+
+## Expand the database
+
+Run the new binary's `quivr migrate` with `QUIVR_CONFIG` pointing to its deployment configuration. It applies pending additive migrations and required dependency setup, leaving tagged contracts untouched. Do not run the previous version's migrator during this rollout.
+
+SQL migrations bound lock acquisition to two seconds and each statement to five seconds. A timeout rolls back the migration transaction. PostgreSQL also ends an unresponsive migrator after five idle seconds in a transaction. Rerun the command after the conflicting transaction finishes. When every migration is already applied, the migrator takes no migration lock. Performance indexes use a separate advisory lock and build concurrently after API or worker startup, without delaying readiness.
+
+## Roll the workers
+
+Start a new worker and wait for its `/readyz` to report ready. Then send SIGTERM to the previous worker and wait for it to exit after draining. Keep compatible plugin versions available to both versions while work is in flight. Confirm every previous worker has drained and stopped before rolling the API.
+
+## Roll the API
+
+Start each new API instance and wait for `/readyz` to return HTTP 204 before routing traffic to it. Send SIGTERM to drain the previous instance after the new one is ready, then wait for it to exit. Keep at least one ready API serving throughout the rollout.
+
+## Initialize document totals
+
+The document statistics migration adds empty rollups without scanning the corpus. New writers maintain totals in their publication transactions. Leave `corpus_stats.bootstrap_enabled` at its default `false` while previous API or worker instances can still write.
+
+After **every previous writer has drained and stopped**, set `corpus_stats.bootstrap_enabled` to `true` in the shared configuration and restart the new processes. Initialization runs outside migration locks. Each API or worker visits at most 1,000 historical Records per transaction; multiple processes divide the work and resume from durable cursors after a restart. Keep an enabled process running until `GET /v0/corpora/{corpus_id}/stats` reports `complete: true` for every Corpus you use. Reading statistics needs `content:read` and a matching Corpus grant. Until then, `complete: false` and `approximate: true` mark partial totals, including large unbounded count responses.
+
+Enabling initialization closes application rollback to a version that does not maintain these totals. Changing the gate requires restarting the affected processes. Disabling the initializer pauses its progress; it does not make old writers safe. Use a forward fix or your data recovery procedure if an old writer runs afterward. See [Read document totals](/guides/follow-changes#read-document-totals) for eligibility and timezone rules.
+
+## Keep the rollback window
+
+Observe ingestion, search and worker processing before ending the rollback window. Before applying contracts or enabling features that close the rollback window, restore the previous binary and configuration using the same rolling process if the application needs rollback. Leave the expanded database in place. Read the release notes for feature-specific compatibility limits; an additive schema alone does not guarantee that previous binaries can read newly written data.
+
+## Apply the contract
+
+Once all previous instances and their work have drained, and you accept closing the rollback window, run the new binary's `quivr migrate --contract`. This applies every pending contract as well as expansions; review all deferred steps before running it. The current application must already work with and without those contracts.
+
+There are no down migrations. After a contract removes fields or constraints, restoring the previous application is no longer supported. Recovery then needs a forward fix or your deployment's data recovery procedure.
+
+## Check it worked
+
+The new API and worker report ready, ingestion resolves new receipts, and search returns the expected records. Check the database readiness with:
+
+```sh
+quivr storage status
+```
+
+Packed files are the only embedding storage format. The command prints `{"compact":true}` after it confirms that the embedded PostgreSQL schema is ready. It uses only PostgreSQL and does not start plugins or access object storage.
+
+Inspect the `X-Quivr-Index-Setup` header on `/readyz` for each process. `pending`, `building`, `retrying` or `conflict` reports degraded performance until the process verifies the indexes. `ready` means it verified all expected indexes as valid. The header is cached: another process may finish setup before this process retries, and later external changes are not reflected after `ready`. These states do not change readiness HTTP 204 when required dependencies are ready. Structured `quivr.postgres.index_setup` events report state, attempt number and retry delay. Keep an API or worker running so setup can finish.
+
+Background setup installs metadata synchronization with bounded DDL locks and
+builds the metadata catalog indexes concurrently. It then copies existing
+metadata in short transactions and resumes after interruption. During this copy,
+filtered listings use bounded record reads and can return non-retryable
+`422 filter_too_broad`; they do not silently omit uncopied metadata. New and old
+binaries maintain the derived entries transactionally once synchronization is installed.
+Setup retires the legacy metadata GIN index concurrently after the copy completes.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| Migration times out, or `migration_busy` | `migration_busy` means another migrator held the advisory lock for more than two seconds; SQL can also exceed its lock or statement bound. Let conflicting work finish, then rerun `quivr migrate`. Inspect `pg_locks` for advisory lock `642001` if its holder stopped responding. |
+| `index_setup_failed` or `index_setup_busy` in background events | Live processes retry with backoff from one second to one minute. Attempts have a 30-minute budget and no separate lock timeout. The next attempt repairs matching invalid indexes left by interrupted builds; readiness proceeds independently. |
+| `index_definition_conflict` | A performance index name belongs to an object with a different definition. Inspect the database catalog and rename the conflicting object. Quivr leaves it untouched and detects your repair on a later attempt. |
+| Worker or API never becomes ready | An expansion is pending or a dependency is unavailable. Run the new migrator, inspect startup logs, and verify that the required services are reachable. |
+| Previous binary fails after a contract | The contract step closed the rollback window. Deploy a forward fix or follow your deployment's data recovery procedure. |
+| `storage_status_failed` | The database could not be checked or the embedded schema is not ready. Run `quivr migrate`, inspect its result, and retry the status command. |
+
+Database writes can wait briefly for additive DDL locks. Compatibility requires both application versions to support the expanded representation; rollout and any data backfills still need deployment-specific review.
+
+Storage failure codes omit raw database and object-storage errors.
+
+## Repair an interrupted index build
+
+Each retry starts an interrupted build from scratch. If setup consistently exceeds 30 minutes, drain and stop API and worker instances to stop automatic maintenance. Build the indexes concurrently in an operator PostgreSQL session with a longer timeout, then restart the instances to verify and reuse them.
+
+Inspect these definitions first:
+
+```sql
+SELECT indisvalid, pg_get_indexdef(indexrelid) AS definition
+FROM pg_index
+WHERE indexrelid IN (to_regclass('segments_by_segmentation'),
+                     to_regclass('records_by_current_version'));
+```
+
+Outside a transaction, use `DROP INDEX CONCURRENTLY` for a matching invalid index before rebuilding it. Preserve incompatible objects and follow the conflict guidance above. Keep the same names, columns and predicates. In that session, allow up to two hours per build; the builds run sequentially:
+
+```sql
+SET lock_timeout = '0';
+SET statement_timeout = '2h';
+CREATE INDEX CONCURRENTLY IF NOT EXISTS segments_by_segmentation
+  ON segments (organization, segmentation_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS records_by_current_version
+  ON records (organization, corpus_id, current_version_id);
+```
+
+A valid matching index is reused. Close the session afterward and restart API and worker instances to finish setup.
+
+## Initialize queue observations
+
+After a database upgrade, API and worker processes initialize queue totals in resumable pages. Initialization continues independently of queue refresh, without waiting between pages while work remains. Keep at least one API or worker process running until initialization finishes. Existing valid observations remain available; missing or stale observations return `503`, and connectors defer acquisition until ingestion counts are available.
+
+Rebuild scope discovery uses a separate cursor and contributes estimated bulk work while its count is incomplete. Receipt, evaluation and delivery backlog metrics also initialize independently; an incomplete metric is unavailable rather than reported as zero.
+
+After upgrading queue freshness tracking, previous snapshots remain unavailable to new readers until a new process refreshes them. Keep an API or worker running. Older processes can still publish observations, but cannot renew the freshness cutoff used by new readers. The oldest unresolved parallel change bounds that cutoff; counts remain available only within two refresh intervals, with a minimum of one minute.
+
+During a rolling upgrade, previous binaries keep reading and writing but do not maintain the new totals. Queue numbers can lag until a reconciliation pass reaches their changes. Retire previous binaries so individual work transitions maintain totals transactionally. Scope-wide changes, such as reprocessing quarantine or re-enabling a subscription, request a bounded paged repair. Queue publication retains its previous observation during that repair; an affected delivery metric is unavailable until repair finishes. Reconciliation starts another bounded, resumable pass five minutes after its previous pass completes. Keep API or worker processes running for it to catch up; do not treat mixed-version counts as an immediate account of every write.
+
+## Maintain hot queue tables
+
+Hot queue and journal tables disable vacuum truncation to keep vacuum from blocking writers. Autovacuum reuses their dead space; files may retain that space. Queue attempt renewals do not update a timestamp index. If the attempt primary key bloats, run `REINDEX INDEX CONCURRENTLY queue_document_attempts_pkey;` in an operator database session outside a transaction. This rebuild allows concurrent writes and needs temporary disk space for a second index.
+
+## Enable parallel imports
+
+This release is a compatibility bridge: its default journal mode is legacy. Apply its expansion and run the bridge on every API and worker before activation. Pre-bridge binaries have no `quivr journal` command. Retire all pre-bridge API and worker processes and let their transactions finish. At activation, both binaries in your rollback window must understand parallel mode; rolling back to a pre-bridge binary after activation is unsafe. Keep at least one API or worker running until queue initialization finishes.
+
+With `QUIVR_CONFIG` naming your operator configuration, inspect and switch the durable deployment-wide mode:
+
+```bash
+quivr journal status
+quivr journal activate --previous-writers-retired
+```
+
+The result reports `parallel`, `published_through`, `allocated_through`, `unpublished_positions` and `pending_age_seconds`. Positions include unused allocation gaps, so the backlog is a position span, not an event count. Independent document writes then use Record/request arbitration. Queue totals reconcile outside acceptance; observations retain the oldest unresolved change's freshness cutoff while reconciliation progresses. Old event IDs and numeric cursors stay valid.
+
+Publication polls every 100 ms. The default engine transaction timeout is 30 seconds. Healthy publication is bounded by the longest [engine transaction timeout](/reference/configuration#postgresql-connections) across replicas plus two poll intervals. If pending age exceeds that bound, check external long-running or prepared transactions and database connectivity. XIDs are cluster-wide: another database's transaction can hold the horizon. Publication stops advancing rather than skip a late event.
+
+Rollback to this bridge honors the current mode. To deliberately return to legacy numbering, retire pre-bridge binaries first and run:
+
+```bash
+quivr journal legacy --writers-drained
+```
+
+The command drains transactions from bridge API and worker processes and queue contributions, establishes the completed prefix and raises legacy heads above allocated positions. Run `quivr journal status` afterward and confirm `parallel` is `false`. Retrying a completed switch leaves its mode unchanged. A timeout leaves the previous mode active; finish queue initialization or drain the conflicting writer and retry. Do not change publication rows or call `setval` by hand beside live writers.
+
+After a logical backup is restored onto a new PostgreSQL cluster, keep every API/worker stopped and run:
+
+```bash
+quivr journal restored --writers-drained
+```
+
+Run this before restart: stored transaction snapshots belong to the old cluster. It expires snapshot start cursors and discards pending XID observations, using the offline writer drain to establish a complete prefix. Clients with those expired cursors rebuild from the catalog; numeric cursors and event IDs survive. Physical restore within the same cluster identity retains its snapshots. Back up the sequence, mode, publication state and events together.
+
+## Next
+
+- [Deploy Quivr](/run-quivr/deploy)
+- [Upgrade or switch a plugin](/run-quivr/upgrade-a-plugin)
+- [Command reference](/reference/cli)

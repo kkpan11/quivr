@@ -1,0 +1,453 @@
+---
+title: "Configuration"
+description: "Every field of the JSON file that configures Quivr's api, worker and migrate processes."
+keywords: ["QUIVR_CONFIG", "configuration", "keys", "destinations", "plugins", "deployment"]
+---
+
+`quivr api`, `quivr worker` and `quivr migrate` read one JSON file, whose path is in the `QUIVR_CONFIG` environment variable. Give every process the same file, except for addresses such as `probe_listen` and the queues each worker serves. `make dev` writes one for the local stack; this page lists every field. `make docs` fails when a field of the engine's configuration is missing here.
+
+In the [release image](/run-quivr/deploy#run-the-image), mount the file read-only and make it readable by UID/GID `10001`. Set `listen` and `probe_listen` to `0.0.0.0` addresses to use published container ports. `QUIVR_CONFIG` selects a file; only the dedicated environment overrides listed below override its fields. The image declares `/tmp` for temporary files; a configured `log_directory` also needs a writable mount.
+
+## Top-level fields
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `worker` | no | Queues and processing slots per worker process. See [Worker queues](#worker-queues). |
+| `queue_observation` | no | Shared backlog refresh pacing. `queue_observation.refresh_interval` is a Go duration from `1s` to `60s`, default `15s`. Use the same value in every API and worker process. |
+| `corpus_stats` | no | `bootstrap_enabled` (`corpus_stats.bootstrap_enabled`) is a boolean, default `false`. Enable resumable initialization of historical document totals only after every previous API and worker has stopped; see [Initialize document totals](/run-quivr/upgrade-quivr#initialize-document-totals). |
+| `database_url` | yes | PostgreSQL connection URL, such as `postgres://quivr:…@db:5432/quivr?sslmode=verify-full` |
+| `postgres` | no | Connection pool sizing and transaction lifetime per process. See [PostgreSQL connections](#postgresql-connections). |
+| `cursor_key` | yes | A secret of at least 32 bytes that signs change-feed cursors. Keep it stable. |
+| `keys` | yes | The API keys, by bearer token. See [API keys](#api-keys). |
+| `temporal_address` | yes | Temporal's frontend address, such as `temporal:7233` |
+| `telemetry` | no | Opt-in OTLP traces and metrics export. See [OpenTelemetry](#opentelemetry). |
+| `tls` | no | Outgoing connection encryption and trust. See [Outbound TLS](#outbound-tls). |
+| `weaviate_url` | yes | The Weaviate search index, such as `http://weaviate:8080` |
+| `weaviate_api_key` | no | Secret sent as `Authorization: Bearer <key>` on every index request. Omitted or empty keeps anonymous access. Use HTTPS for an external index. |
+| `vector_index` | no | How the search index compresses each vector space. Default 8-bit compression. See [Search index compression](#search-index-compression). |
+| `s3` | yes | Object storage for original bytes and derived artifacts. See [Object storage](#object-storage). |
+| `listen` | no | Address of the public HTTP API. Default `127.0.0.1:8080`. |
+| `probe_listen` | no | Private address of `/healthz`, `/readyz` and `/metrics`. Default `127.0.0.1:8081`; give each process its own. |
+| `log_level` | no | Minimum log level: `debug`, `info` (default), `warn` or `error`. `QUIVR_LOG_LEVEL` overrides the file. |
+| `instance` | no | Process identity in each log event. Default hostname and PID; `QUIVR_INSTANCE` overrides the file. |
+| `environment` | no | Deployment environment label in each log event. Default `unspecified`; `QUIVR_ENVIRONMENT` overrides the file. |
+| `shutdown_grace` | no | Shared grace period for draining HTTP requests and background work after SIGTERM or SIGINT. Positive Go duration, default `60s`; `QUIVR_SHUTDOWN_GRACE` overrides the file. |
+| `log_directory` | no | Also write JSON logs to rotating files in this folder; stdout remains enabled. Four files per process, up to 1 MiB each. |
+| `retrieval` | no | Search profile aliases and coverage refresh interval. See [Search profiles](#search-profiles). |
+| `plugins` | no | The plugins this deployment calls. See [Plugin pins](#plugin-pins). |
+| `ingestion_evaluation_concurrency` | no | Evaluation activities in flight per worker. Default `4`, range `1`–`32`; `0` selects the default. Served ingestion has separate capacity. |
+| `ingestion` | no | Source media routing and the default ingestion plugin. See [Ingestion routing](#ingestion-routing). |
+| `plugin` | no | One pin, shorthand for a one-item `plugins` list; both may be combined |
+| `destinations` | no | Webhook destinations for alerts. See [Webhook destinations](#webhook-destinations). |
+| `delivery` | no | Webhook retry policy, worker only. See [Delivery](#delivery). |
+| `credential_key` | no | A secret of at least 32 bytes that encrypts connector credentials at rest. Without it, credentials are refused with `503 credentials_unavailable`. Keep it identical on api and worker, and stable. |
+| `public_url` | no | The address where sources reach this API, such as `https://quivr.example.com`. Connector kinds that receive webhooks need it. |
+| `connector_min_interval` | no | Shortest polling interval an instance may ask for, a Go duration. Default `30s`. |
+| `connector_push` | no | Declared source API protection: `rate_per_second` (default `10`, range `0.001`–`100000`), `burst` (default `100`, maximum `100000`), `idempotency_ttl` (Go duration, default `24h`, range `1ms`–`168h`) and `trusted_proxy_cidrs` (default empty). Instance `push_policy` can override rate/burst and set `allowed_cidrs`. |
+| `retain_import_audit_detail` | no | Retain full canonical import requests and successful plugin invocation ledger detail. Default `false`. Required work input, request digest, normalization outcomes, extensions and failure/conflict diagnostics remain durable. |
+| `audit_retention_months` | no | Calendar months to retain sensitive-action audit entries. Default `12`, range `1`–`1200`; `0` selects the default. The worker prunes them on the change-pruning schedule. See [Audit trail](#audit-trail). |
+| `change_retention` | no | How long the change feed keeps events and a cursor stays valid. Default `168h` (7 days). |
+| `history_retention` | no | Installation-wide retention of import and alert detail. Defaults: `import_detail: "720h"`, `alert_detail: "720h"`, `interval: "1h"`, `disabled: false`. See [History retention](#history-retention). |
+| `change_stream_poll` | no | How often an open change stream (`/v0/changes/stream`) checks for new events. Shorter delivers sooner and reads the database more often. Api only. Default `250ms`. |
+| `change_prune` | no | When the worker prunes the change feed. See [Change feed pruning](#change-feed-pruning). |
+| `pinned_plugin_attempts` | no | Attempts before `pinned_plugin_unavailable` after a plugin leaves the active plan: an unavailable plugin during an Operation, an incompatible ingestion owner, or an ingestion invocation deadline. Live imports, including normalization, keep retrying reachability outages (connection failure or manifest digest mismatch) on their original pin. Worker only. Default `10`. |
+| `plugin_plan_poll` | no | How often api and worker check whether the active Pipeline Plan changed, to follow it without restarting. Default `2s`. |
+| `observability` | no | Counters of plugin calls, searches, document steps, documents received and Matches, read with an `observability:read` key. See [Observability](#observability). |
+| `rebuild` | no | Parallel Version coverage during Corpus rebuilds. See [Rebuild](#rebuild). |
+| `backfill` | no | How backfills run and when their cost needs a confirmation. See [Backfill](#backfill). |
+| `migration_wait` | no | How long a worker that starts before the api has applied its migrations waits for them, unready, before it exits. `0s` exits at once. Worker only. Default `5m`. |
+| `projection_purge_grace` | no | How long search objects of superseded Versions are kept before they are deleted, worker only. Default `1h`. |
+| `projection_purge_timeout` | no | Deadline for each purge selection or delete request, worker only. Default `60s`; positive and at most `120s`. Search and write request deadlines are independent. |
+| `tei_url` | no | A Text Embeddings Inference server that encodes queries for Corpora built before the `core-ingest` plugin; not needed on a new deployment |
+| `m365` | no | Refused. The Microsoft 365 settings moved to the `m365-mail` plugin's pin configuration. |
+
+Durations are Go durations: `30s`, `10m`, `168h`. Unknown fields refuse startup. Remove the former `connector_fixtures` and `monitoring_fixture_evaluator` settings; the acceptance harness now pins its fixture plugin through `plugins`.
+
+## PostgreSQL connections
+
+`postgres.max_connections` sets the maximum connections in each process's pool.
+It accepts a positive integer up to `2147483647`; omitted or `0` preserves the
+`database_url`'s `pool_max_conns`, or pgx's default of the larger of four and the
+process's CPU count. Negative values and limits below the URL's `pool_min_conns`
+or `pool_min_idle_conns` are refused. A positive JSON setting overrides
+`pool_max_conns`. It applies to API, worker, migrate and storage commands;
+restart processes after changing it. Worker activity slots are separate.
+
+For example, a configuration fragment with a pool of 16 connections:
+
+```json
+{"postgres": {"max_connections": 16}}
+```
+
+`postgres.transaction_timeout` bounds every engine database transaction from `BEGIN`.
+The default is `30s`; a positive Go duration of at least `1ms` is required, up to
+PostgreSQL's signed 32-bit millisecond limit. It overrides the URL setting and
+applies to API, worker, migration, journal and storage commands on PostgreSQL 17
+or later. Restart processes after changing it. A timeout closes the database
+session; retry an ambiguous command with its original idempotency key. Parallel
+change publication normally waits at most the longest limit across replicas plus
+two 100 ms publisher polls. Other clients and prepared transactions can hold its
+horizon longer; inspect [journal status](/run-quivr/upgrade-quivr#enable-parallel-imports).
+
+Set PostgreSQL's server `max_connections` so usable connections cover the sum of
+pool sizes across **all replicas**, other clients and deployment headroom.
+Subtract PostgreSQL's reserved connections from the server limit. One API,
+one live worker and eight bulk workers with pools of 16 can use 160 connections;
+rolling deployments can temporarily add more. Size memory for concurrent query
+operations as well as connections. The [deployment templates](https://github.com/The-Vibe-Company/quivr/tree/main/deploy/compose)
+document server memory ratios and startup settings.
+
+## Configuration refusals
+
+Engine configuration refusals exit with status `1` and log `event: quivr.failed`, an `error_code`, a `field`, and a safe `problem` explanation. The field names a setting, such as `log_level` or `cursor_key`, or a settings group, such as `tls.weaviate`. Missing or unreadable configuration files, malformed JSON and unknown keys use `QUIVR_CONFIG`; JSON type errors name the declared field when one is identifiable; a type error at the JSON root uses `QUIVR_CONFIG`. Diagnostic fields omit supplied values, file paths and raw causes, including secret values.
+
+| Error code | Meaning |
+| --- | --- |
+| `config_missing` | A required setting is absent, or a required group is empty. |
+| `config_invalid` | A setting has the wrong type, format or range, or cannot be loaded. |
+| `config_conflict` | Settings contradict each other, such as a TLS switch with the wrong endpoint scheme or an initial retry delay above its maximum. |
+
+Plugin-pin validation also exits with status `1` but keeps its existing plugin issue codes without `field` or `problem`. Other process failures use `process_failed`.
+
+## Import audit detail
+
+`retain_import_audit_detail` applies to both the API and workers. Set it consistently and restart them after changing it. Compact storage keeps one required execution input and a SHA-256 digest of each full request for idempotency. Successful normalization extensions live in an immutable outcome object; PostgreSQL keeps its pointer, owner, manifest and operational outcome. Failure and conflict diagnostics remain available. The normalizer’s deterministic invocation digest remains for detecting divergent output.
+
+With `true`, Quivr also retains full canonical request copies and successful normalization invocation IDs. This adds database storage and import writes. Changing the option affects future capture; it does not remove previously captured detail. Sensitive-action auditing and change-feed retention have separate settings.
+
+## Audit trail
+
+Quivr records sensitive HTTP commands in PostgreSQL and emits a `quivr.audit` JSON log event after each audit entry commits. The API key identifier matches `api_key_id` in the access log; bearer tokens, issued token secrets, credential values and request bodies are excluded. Audit targets retain resolved Record IDs even when a write-only command response omits them; reading those entries still requires `audit:read` and organization-wide Corpus scope. Each entry records the time, organization, action, target, accepted or refused outcome, request ID and bounded status details. Plugin activation and rollback also record the resulting plan ID. Connector creation includes any credential deposit in the same transaction; credential deposits and replacements record the credential version.
+
+Audited commands cover Corpus creation and retrieval configuration, plugin registration, activation and rollback, connector creation, disable, schedule changes, runs, credential replacement and token creation, rotation and revocation, Record withdrawals, Saved Query and Subscription deletion, and rebuild, backfill, reprocess, cancel, rerun, pause, resume, vector-space promotion and evaluation retirement commands. Reads, searches and successful dry-run estimates create no audit entry. API keys and their permissions are file configuration; there is no HTTP mutation route to audit. Connector deletion is represented by its disable command.
+
+Read entries with `GET /v0/admin/audit` using a key with `audit:read` and `corpora: ["*"]`. Other admin permissions do not grant access. Results belong only to that key's organization. Filter by `since` (inclusive), `until` (exclusive), `actor`, `action`, `target_type` and `target_id`; use `limit` (default `50`, range `1`–`200`) and `page_cursor` for paging. Pass a response's `next_page_cursor` as the next request's `page_cursor`, carrying the same filters and limit. The last page omits `next_page_cursor`. Time filters use RFC3339 timestamps; other filters match exact identifiers or action names. Audit IDs are decimal strings. Unknown API keys are refused before database admission and remain visible in structured access logs. Authenticated command refusals are retained in the organization's audit trail.
+
+Successful command changes and their entry commit together. If the audit write fails, the command rolls back and returns `503`. Refused commands roll back any command writes before recording their refusal. Process configuration changes made outside the HTTP API are outside this request audit trail.
+
+`audit_retention_months` defaults to twelve calendar months. Restart the worker after changing this configuration. The existing worker pruning loop removes expired entries in bounded batches; no worker means no retention pruning. Ordinary `UPDATE`, `DELETE` and `TRUNCATE` of `audit_events` are rejected. The retention function is the supported removal path; its execution privilege is revoked from `PUBLIC`. The migration role owns the function and retains execution; a separate runtime role needs an explicit grant on `public.prune_audit_events(integer, integer)`. For privilege separation, run migrations as a schema owner and use a separate runtime role with `SELECT` and `INSERT` on `audit_events`, sequence access and `EXECUTE` on `prune_audit_events`, without table ownership or `UPDATE`, `DELETE`, `TRUNCATE` grants. A database owner or superuser can change schema guards and must remain outside the runtime role.
+
+## Logs and shutdown
+
+Engine processes write one JSON event per line to stdout. `ts` is an RFC 3339 timestamp in UTC, ending in `Z`, regardless of the host timezone. Every event includes `ts`, `level`, `msg`, `service`, `version`, `instance`, `environment`, `trace_id` and `span_id` (empty outside a trace); events within an HTTP request also include `request_id`. `service` distinguishes `quivr.api`, `quivr.worker` and `quivr.migrate`. `version` reports the distribution release, independent of API `v0` and plugin engine compatibility `0.2.0`. The startup event also includes the commit as `revision`, `api_version` and `plugin_engine_version`; [Check that it is ready](/run-quivr/deploy#check-that-it-is-ready) lists the HTTP and metric version checks. Debug events are hidden at the default `info` level. Nonempty environment overrides take precedence over the JSON file; unknown levels, malformed durations and nonpositive grace periods refuse startup.
+
+Each completed public or probe HTTP request writes an access event with `route`, `method`, `status`, `duration_ms`, `response_size` (bytes written), `client_ip`, `api_key_id`, `error_code` and `request_id`. Routes are registered templates, with `unmatched` for unknown paths. For public requests, client IP follows the trusted proxy policy in `connector_push.trusted_proxy_cidrs`; otherwise it is the socket peer. Probe requests use the socket peer. The key ID is a 128-bit SHA-256 fingerprint of a bearer token present in the configured `keys`; it is empty for instance tokens and requests without a configured API key. No bearer token, request body, query string or arbitrary request path is logged.
+
+Lifecycle events use `event`: `quivr.start`, `quivr.ready`, `quivr.draining` and `quivr.stop`. Startup includes an allowlisted summary of effective process settings, with counts and enabled flags for sensitive configuration. Credentials, plugin settings and connection URLs are excluded. Raw error details are redacted at the logging boundary; use stable event and error codes for routing.
+
+On SIGTERM or SIGINT, readiness becomes `503` before drain begins. New public requests are refused, public listeners close, and admitted work can finish within one `shutdown_grace` budget. Probes remain available during the drain. Work still running at the deadline is canceled, open HTTP connections are closed, and unfinished durable work can resume on another worker. Streaming connections count as in-flight requests and may use the whole grace period. The final counter flush shares this deadline.
+
+## OpenTelemetry
+
+Set `telemetry.endpoint` in every engine process to export traces and metrics to your collector. An omitted or empty endpoint disables export; tracing uses a no-op provider and installs no dependency tracing or exporter goroutines. `/metrics` remains available with the same Prometheus metric names, labels and buckets. SDK meters own aggregation; no collector is needed for scraping. The OTLP reader samples backlog gauges even when nobody scrapes `/metrics`.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `endpoint` | Empty (export off) | Collector base URL, such as `https://collector.example.com:4318`. HTTP appends `/v1/traces` and `/v1/metrics`; signal-specific URLs ending in either path are refused. gRPC permits no path. URLs with credentials, queries or fragments are refused. |
+| `protocol` | `http/protobuf` | `http/protobuf` or `grpc`. Use an `https` endpoint for verified TLS, or `http` for plaintext to a trusted local collector. |
+| `headers` | `{}` | Collector authentication headers, used for both signals. Values are excluded from logs. |
+| `sampling_ratio` | `1` | Root trace sampling probability, from `0` to `1`. Children honor their parent's sampled flag, including incoming W3C context. |
+| `resource_attributes` | Engine service and version | Deployment identity as string key/value pairs. `service.name` and `service.version` use process settings. Configured `instance` and `environment` also become resource attributes unless you override them. |
+
+For example, not run:
+
+```json
+{"telemetry":{"endpoint":"https://collector.example.com:4318","protocol":"http/protobuf","sampling_ratio":0.1,"resource_attributes":{"deployment.environment.name":"staging"}}}
+```
+
+The API honors W3C `traceparent` and `tracestate`. Send `X-Request-ID` as 1–128 ASCII letters, digits, dots, underscores or hyphens; missing, duplicate or invalid IDs are replaced. Responses echo `X-Request-ID`; JSON errors include `request_id` and, when a valid trace context is present (including an incoming `traceparent` while export is disabled), `trace_id` and `span_id`. Logs carry the same trace fields. Request IDs are correlation values, so use opaque IDs rather than names or secrets.
+
+One trace crosses durable ingestion and operation queues, Temporal workflows and activities, plugin calls, monitoring evaluation and webhook retries. Spans cover HTTP route templates, PostgreSQL, Weaviate and S3. They exclude SQL statements, query text, URLs, object keys, record identifiers, bodies and baggage. Resource attributes are operator-controlled: keep customer data out of them. `observability.record_query_text` only governs the stored search statistics below, not span attributes.
+
+Export runs asynchronously. A collector outage does not stop requests; the SDK's bounded queue can drop telemetry. Look for `quivr.telemetry.export_failed`, with no collector credentials or raw error details. Shutdown flushes exporters within the shared grace deadline. Plugin SDKs continue W3C context automatically; configure an exporter separately in each plugin process to observe its internal spans. See [Plugin protocol](/reference/plugin-protocol#trace-context).
+
+## Outbound TLS
+
+`tls` configures `temporal`, `weaviate`, `postgres`, `s3` and `plugins` independently. All enabled TLS verifies the server certificate and name, using system roots by default, and requires TLS 1.2 or newer. There is no insecure verification mode or fallback to plaintext. [Run Quivr behind TLS](/run-quivr/tls) covers platform termination of incoming HTTPS; the engine's API and probe listeners serve plain HTTP.
+
+Each dependency accepts these optional fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | See below | Explicit TLS on/off switch. For HTTP dependencies, it must agree with the endpoint scheme. |
+| `ca_file` | System roots | Readable PEM CA bundle path, added to system roots. |
+| `cert_file` | None | PEM client certificate path, configured with `key_file`. Refused for plugins. |
+| `key_file` | None | Matching PEM private key path. Refused for plugins. |
+| `server_name` | Endpoint host | DNS hostname or IP address to verify; DNS names are also sent as TLS server name. |
+
+Temporal defaults to plaintext; enable it with `tls.temporal.enabled: true`. Its address stays `host:port`. Weaviate and S3 select TLS from their `https://` endpoint when `enabled` is omitted. An explicit switch never rewrites a URL: `true` requires HTTPS and `false` requires HTTP. TLS settings on a disabled connection refuse startup.
+
+Railway maps optional `WEAVIATE_API_KEY` to `weaviate_api_key` for API and worker processes. The Compose local and load-stack configuration generators accept the same variable; installations with their own runtime file set `weaviate_api_key` there. Index reset and upgrade helpers and evaluation clients use the configured key. Keep it out of source control. The engine redacts it from logs and index error explanations.
+
+Weaviate and S3 redirects must stay on the endpoint's origin (scheme, hostname and port). Redirects to plaintext or another origin are refused before connecting, so client certificates remain with the configured dependency.
+
+PostgreSQL uses `database_url` when `tls.postgres` is omitted: `sslmode=verify-full` verifies the certificate and hostname, with system roots unless the URL supplies `sslrootcert`. `sslmode=disable` selects plaintext. Opportunistic or unverified modes (`prefer`, the driver's default, `allow`, `require`, `verify-ca`) are refused. Explicit `tls.postgres` settings override the URL's TLS policy for every configured host and remove plaintext fallbacks; omitted `enabled` with certificate settings enables TLS. Prefer configuring trust in one place. URL certificate file options are still parsed, so remove obsolete file paths when switching to `tls.postgres`.
+
+Plugin settings apply to discovery and every contribution call, including newly registered plugins and earlier pipeline plans. With omitted `enabled`, each endpoint selects HTTP or verified HTTPS; a CA bundle applies to HTTPS endpoints. Explicit `true` requires every plugin endpoint to use HTTPS. Explicit `false` requires HTTP and still preserves the connector rule: non-loopback connectors must use HTTPS. Plugin redirects are always refused. Plugin mTLS is not supported.
+
+Unreadable or malformed certificate files, incomplete or mismatched client identity, disabled TLS with certificate settings, and URL/switch conflicts refuse startup with the dependency's name. Certificates load at startup; restart the API and worker after rotating them. Remote handshake failures make the dependency unavailable; they never trigger an insecure retry.
+
+## API keys
+
+`keys` maps each bearer token to what it may do. Every request's key decides its Organization, its actions and its Corpora:
+
+```json
+"keys": {
+  "<random token>": {"organization": "acme", "actions": ["corpora:read", "content:write", "search:query"], "corpora": ["*"]}
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `organization` | The Organization the key acts for. Ordinary requests stay within it; explicit operator grants can expose installation-wide counts. |
+| `actions` | What the key may do, from the list below |
+| `corpora` | The Corpus ids it may reach, or `["*"]` for all of its Organization's Corpora. Creating a Corpus needs `*`. |
+
+| Action | Allows |
+| --- | --- |
+| `corpora:read`, `corpora:write` | reading and creating Corpora |
+| `content:read`, `content:write` | reading Records, Versions and Receipts; submitting and withdrawing content |
+| `blobs:read`, `blobs:write` | reading upload sessions and Blobs; uploading files |
+| `search:query` | searching |
+| `changes:read` | reading the change feed |
+| `monitoring:read`, `monitoring:write` | reading and managing Saved Queries, Subscriptions, Matches and Deliveries |
+| `connectors:read`, `connectors:write` | reading and managing Connector Instances |
+| `connectors:admin` | creating, listing, rotating and revoking a Connector Instance's push tokens on authorized Corpora; give it only to an operator key |
+| `connector:push` | calling a source plugin’s declared API routes on authorized Corpora |
+| `operations:read`, `operations:write` | reading, cancelling and rerunning Operations |
+| `projections:rebuild` | starting a Corpus rebuild |
+| `queues:read` | reading installation-wide document backlog (`GET /v0/admin/queues`); requires all-Corpora scope; use a dedicated key with only this action for autoscalers |
+| `plugins:admin` | reading the plugin registry and registering and activating plugins (`/v0/admin/plugins`), backfilling a Corpus (`/v0/admin/backfills`) and promoting a vector space (`/v0/admin/spaces/{id}/promote`); give it only to an operator key |
+| `audit:read` | Reading sensitive-action audit entries in the key's organization (`/v0/admin/audit`); requires `corpora: ["*"]`. |
+| `observability:read` | following documents through their processing steps (`/v0/admin/documents`) and reading the counters of plugin calls, searches, steps, documents received and Matches (`/v0/admin/stats/*`) |
+
+## Object storage
+
+`s3` points at any S3-compatible store:
+
+| Field | Meaning |
+| --- | --- |
+| `endpoint` | The store's URL, such as `https://s3.example.com` |
+| `access_key`, `secret_key` | Its credentials |
+| `bucket` | The bucket Quivr writes to; `quivr migrate` creates it when missing |
+
+Upload grants sign the expected SHA-256 into the presigned PUT. Confirmation checks the stored size and SHA-256 with `HeadObject` and `ChecksumMode=ENABLED`. A matching full-object checksum (SHA-256 of all stored bytes) verifies the upload without downloading its bytes. This applies to connector imports and direct `/v0/uploads` confirmation.
+
+| Store | Upload integrity and confirmation |
+| --- | --- |
+| Amazon S3 | PUT validates `x-amz-checksum-sha256`; checksum-enabled HEAD returns it. Encrypted objects may also require AWS Key Management Service (KMS) permissions to read the checksum. |
+| Bundled SeaweedFS 4.45 | Presigned PUT validates SHA-256 and rejects altered bytes with `BadDigest`; checksum-enabled HEAD returns the stored checksum. |
+| Other S3-compatible stores, or existing objects without SHA-256 | Confirmation streams the object and checks its length and SHA-256 when HEAD returns no usable full-object checksum, or rejects HEAD with HTTP 400, 405 or 501. |
+
+Composite multipart checksums, assembled from individual part checksums, also use streaming verification. Quivr never trusts client-supplied object metadata or an ETag as SHA-256 proof. A size or checksum mismatch rejects the upload; unavailable storage leaves confirmation retryable. Canonical and vector-file reads retain their byte-level integrity checks.
+
+## Plugin pins
+
+Each item of `plugins` pins one plugin. [Pin a plugin](/run-quivr/pin) explains how to use them.
+
+| Field | Meaning |
+| --- | --- |
+| `manifest` | Path of the plugin's `quivr-plugin.yaml`, the exact file it was built from |
+| `endpoint` | The plugin's base URL. A connector plugin needs `https://` unless it is on loopback. |
+| `configuration` | The plugin's configuration, validated against the schema its manifest declares |
+| `routes` | Normalizers only: the media types sent to it. Each route has a `media_type` and a `mode`, `required` (the default) or `optional`, which lets a `text/*` file fall back to plain text when the plugin fails. |
+| `kinds` | Alert rules only: the alert kinds this deployment accepts, such as `["keywords"]`. Default: every kind the plugin declares. |
+| `spaces` | Ingestion plugins only: the vector spaces to enable, each `served` or `evaluation`; exactly one is served. Default: the only declared space, served. |
+
+## Ingestion routing
+
+Several ingestion plugins can be pinned together. `ingestion` chooses one for each whole Record Version, using the media type of the submitted, verified Blob (`application/pdf`, `text/html`, and so on), or `text/plain` for inline text. Normalization preserves that source type: a PDF converted to text still follows the PDF route. Each selected plugin segments and embeds the Version's text Parts.
+
+| Field | Meaning |
+| --- | --- |
+| `default` | Plugin id for source types without a route. Defaults to `core.ingest` when pinned, or the only ingestion plugin. With several other plugins, name a default. |
+| `routes` | Map of exact source media types to pinned ingestion plugin ids. Invalid targets prevent startup. |
+| `evaluation` | Map of source media types to lists of additional ingestion plugin ids. They fill independent projections after served enrichment succeeds. Targets must be pinned, distinct and different from that format's served plugin. |
+
+Illustrative routing with both plugins pinned:
+
+```json
+{"ingestion": {"default": "core.ingest", "routes": {"application/pdf": "core.ingest", "text/plain": "example.hash_embedder"}}}
+```
+
+A plugin listed only for evaluation keeps its own segmentation and vector coverage. Evaluation work runs on separate activity capacity; a refusal, timeout or outage is recorded in the Version's diagnostics with the plugin id and never changes served readiness.
+
+Each serving plugin owns its distinct vector spaces and serves one of them. Search uses the spaces whose owners have served projections in the requested Corpora. A plugin serving another source format does not encode an ordinary query for a Corpus where its projections are evaluation-only. Routes, defaults and evaluation selections are stored in immutable Pipeline Plans; work keeps the plan it started with during activation and rollback. Backfill an evaluation owner's primary space on past Versions before [activating it as served](/run-quivr/upgrade-a-plugin#promote-an-evaluation-plugin). Activation and rollback require complete coverage of each returning owner's own segments; the former projection stays available for rollback. Embedding image, audio or video Parts is a separate capability.
+
+To measure an evaluation projection, send `evaluation_plugin` and `evaluation_space` together in `/v0/search`. The space must belong to that plugin and be carried by every requested Corpus. Omitted fields follow served routing. `GET /v0/corpora/{corpus_id}/vector-spaces` reports each owner's `total_segments` and fully covered `versions_covered`; different owners may cut the same documents differently.
+
+The search protocol carries at most 16 enabled vector spaces, counting served and evaluation spaces across all pinned ingestion plugins. Startup refuses a configuration above that protocol limit.
+
+## Search profiles
+
+`retrieval.coverage_refresh` is a positive Go duration, default `10s`, between background coverage refresh attempts after the previous count finishes. Shorter intervals update informational counts sooner and perform more database work. At most one count runs per process, with a one-minute bound. See [Search profiles](/run-quivr/search-profiles) for unknown and stale coverage.
+
+`retrieval.profiles` maps deployment short names to full `plugin_id/profile` names. Pin several retrieval plugins in `plugins`, then choose which profile serves each short name. An explicit map must contain `default`; every target must be declared by an installed retrieval plugin. Short names cannot contain `/` or surrounding whitespace.
+
+This illustrative configuration selects profiles from two installed retrieval plugins:
+
+```json
+{
+  "retrieval": {
+    "profiles": {
+      "default": "core.retrieve/default",
+      "deep": "example.fusion_retriever/deep"
+    }
+  }
+}
+```
+
+A deployment with one retrieval plugin and no map keeps its existing short names. Several retrieval plugins require an explicit map. Searches also accept full names directly. `GET /v0/search/profiles` lists every installed profile, its `full_name`, provider and `aliases`, including profiles without short names. Activating a new version replaces only that plugin; the map must still resolve in the new plan. [Search profiles](/run-quivr/search-profiles) explains short and full names with pictures.
+
+## Search index compression
+
+`vector_index` sets how Weaviate stores each vector space's vectors. Every space uses an HNSW index. `quantization` is `rq-8` (the default, 8-bit rotational quantization), `rq-1` (1-bit, the smallest) or `none` (full precision). A compressed index keeps the full-precision vectors on disk and rescores its best candidates with them. `rescore_limit` sets the minimum number of candidates to fetch for full-precision rescoring. With RQ-8, omitted or `0` disables rescoring to avoid extra disk reads; a positive value enables it. With RQ-1, omitted or `0` keeps Weaviate's default of 512. `vector_index.spaces` overrides the setting for one space, by its declared id or its full `<id>@<version>` key. An omitted field of an override takes the deployment's value; an override to `none` drops the deployment's `rescore_limit`. An invalid value, or a `rescore_limit` with `none`, refuses startup.
+
+```json
+{
+  "vector_index": {
+    "quantization": "rq-8",
+    "spaces": {
+      "example.embedder.large": { "quantization": "rq-1", "rescore_limit": 512 }
+    }
+  }
+}
+```
+
+The setting is part of each generation. Changing the recorded setting applies to new Corpora, and to an existing Corpus once you rebuild it. The zero RQ-8 default is reconciled in place on existing compressed indexes: the deployment schema bootstrap (`quivr migrate`) updates the built-in legacy vector, and the first search or vector write using a generation updates its named vectors (the separate indexes for its spaces). No rebuild is needed for that default update; explicit positive limits and RQ-1 settings are preserved. Start the rebuild with `POST /v0/corpora/{corpus_id}/rebuilds` and a body containing a new `idempotency_key`, using a key with `projections:rebuild`. Follow the returned Operation with `GET /v0/operations/{operation_id}`, using `operations:read`. The Corpus keeps serving its previous generation until the rebuild activates.
+
+## Webhook destinations
+
+`destinations` maps a destination id, which Subscriptions name in `destination_id`, to where alerts are sent:
+
+| Field | Meaning |
+| --- | --- |
+| `organization` | The Organization whose Subscriptions may use it |
+| `url` | The receiver's URL. Private and loopback addresses are refused unless `delivery.allow_private_destinations` is set. |
+| `secret` | The Standard Webhooks signing secret, `whsec_` followed by base64 |
+| `secret_env` | The name of an environment variable holding the secret instead; prefer it in real deployments |
+
+## Delivery
+
+`delivery` tunes webhook retries. Every field is optional.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `retry_initial` | `1s` | First retry delay; each retry doubles it, with jitter |
+| `retry_max` | `5m` | Longest delay between two attempts |
+| `window` | `24h` | How long a delivery is retried before it is `exhausted` |
+| `timeout` | `10s` | Deadline of one attempt |
+| `allow_private_destinations` | `false` | Allow loopback, private and link-local receiver addresses, including an internal webhook receiver in a self-hosted deployment. Startup logs a `WARN` when enabled. |
+
+<Warning>
+`delivery.allow_private_destinations` disables the startup and dial-time private-address guards. This increases server-side request forgery (SSRF) exposure: a configured receiver can reach internal services, including through DNS resolution. Enable it only for trusted destinations and restrict outbound network access. With the default `false`, both guards remain active.
+</Warning>
+
+## History retention
+
+`history_retention` controls when the worker reclaims historical detail for the whole installation. `import_detail` and `alert_detail` default to `720h` (30 days); `interval` defaults to `1h`. Durations must be positive Go durations. Set `disabled` to `true` to stop history pruning. Restart the worker after changing these settings.
+
+Each pass scans at most 1,000 candidates for each of five storage stages, one Organization per transaction. Each transaction has a four-second budget and a 100 ms lock timeout. Persisted cursors advance over protected rows, resume after restart and wrap after the table is scanned. Retention is a minimum age, not a deletion deadline: large backlogs, protected work and unavailable workers delay reclamation. Shorten `interval` if the scan cannot keep up with your installation's history growth.
+
+Expired, resolved import receipts lose full request copies after their work is dispatched. Their request digests, keys and outcomes stay, so retries and connector unchanged-item checks keep working. Accepted revision reservations stay too; only execution payloads of Versions that are withdrawn or neither current nor desired, without pending or reprocessable work are compacted. Current, desired, quarantined and unfinished inputs remain available.
+
+Old, completed evaluation intents can be removed for withdrawn Versions or Versions that are neither current nor desired, only after evaluation dispatch has processed their event position and no evaluation is pending. The earliest decided outcome for each Subscription Version/Record Version pair stays indefinitely, so delayed events or a later return to that Version cannot repeat a paid evaluation. Redundant completed intents can expire. Match and notice identities, predecessor references and admission facts remain indefinitely. Match evidence expires only after its feed position is pruned and no unfinished evaluation or unanswered delivery needs it. Reading expired evidence returns `410 evidence_expired` with `retryable: false`; successful responses retain their original evidence. A Match history page containing expired evidence returns the same error with `resync_url`; following it explicitly skips the unavailable interval. Export evidence within the retention window when you need a lasting copy.
+
+Delivery records, delivery attempts and outcomes remain indefinitely under their existing append-only guarantees. Their notice bytes remain available even after acknowledgement; pending, in-flight and exhausted deliveries keep their original history for retries. Pull-only notice bodies can be compacted after their feed positions have been physically pruned. Reclaiming delivery attempt history requires a separate migration/privilege decision.
+
+The worker initializes nullable alert/evaluation clocks and progress rows through ordinary, bounded application writes. A row with no clock starts a full retention window when first scanned, including existing history and rows written by previous binaries. Migrations do not backfill history or install new procedures or triggers.
+
+During a rolling upgrade, set `history_retention.disabled` to `true` before starting new workers. Drain and stop all previous API binaries before enabling history retention, then restart the new workers with pruning enabled. Previous APIs do not recognize expired evidence. Once evidence is reclaimed, rolling back to those APIs would produce incompatible historical reads. Keep pruning disabled while you need that rollback window.
+
+## Change feed pruning
+
+`change_prune` tunes when the worker deletes change-feed events older than `change_retention`. Every field is optional.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `interval` | `1m` | How often the worker prunes |
+| `retention` | `change_retention` | How long events are kept; shorter windows require `allow_short_retention` and named `organizations` |
+| `organizations` | every Organization | Prune only these Organizations |
+| `allow_short_retention` | `false` | Allow `retention` shorter than `change_retention` for explicitly listed `organizations`, for deployments accepting earlier change-event deletion. Startup logs a `WARN` when enabled. |
+
+<Warning>
+`change_prune.allow_short_retention` can permanently delete change-feed events before API cursors expire by age. Slow consumers can lose events and receive `410 cursor_expired`; they must resynchronize from the catalog. It does not delete canonical Records. With the default `false`, pruning cannot shorten the API retention window. Prefer setting a shorter `change_retention` consistently on api and worker when they should promise the same window.
+</Warning>
+
+## Rebuild
+
+`rebuild` tunes Corpus rebuilds. The worker applies it after a restart.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `concurrency` | `8` | Versions in flight inside one rebuild step, range `1`–`256`; `0` selects the default. `1` restores serial work. Worker only. |
+
+Each step refills a free slot as soon as its Version finishes, including across
+candidate pages. A slow Version occupies one slot while the others keep working.
+The worker saves progress below the earliest unfinished Version; stored coverage
+prevents counting completed Versions twice after a restart. A final check catches
+new eligible Versions behind that saved position before the index switches.
+Steps stop starting work after one minute. Once every active Version finishes,
+the worker pauses for 200 ms before the next step starts. Shorter activity deadlines stop
+admission earlier. The worker checks for cancellation every five seconds while
+storage remains available.
+Rebuild and backfill activities use the [bulk worker queue](#worker-queues),
+whose activity budget is separate from live ingestion. Each active rebuild
+step can run `concurrency` Versions; the process-wide upper bound is
+`worker.slots.bulk × rebuild.concurrency` when every bulk slot runs a rebuild.
+Backfills share the bulk activity budget and advance between rebuild steps.
+
+The ingestion plugin still enforces its own batching and provider concurrency
+limits. Live ingestion and rebuilds share those limits, storage and indexing
+capacity. Lower `concurrency` if a rebuild puts pressure on those resources;
+separate activity queues reserve worker slots, not provider throughput.
+Coverage records the Versions and vectors already included in the rebuild target.
+Retries reuse committed coverage and count each Version and vector once.
+Cancellation retains already committed coverage and counters. It stops new
+candidate work when observed, cancels in-flight calls, and joins them before
+settling the Operation. Coverage commits require the Operation to be running;
+cancellation cannot activate the target.
+
+## Backfill
+
+`backfill` tunes [backfills](/run-quivr/backfill-a-vector-space). Every field is optional.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `rate` | `2` | The most Versions per second one backfill processes. Worker only. |
+| `concurrency` | `4` | Versions in flight inside a backfill step, range `1`–`32`; `0` selects the default. `1` restores serial work. Worker only. |
+| `poll` | `5s` | How often a paused backfill checks whether it was resumed or canceled. Worker only. |
+| `max_cost_without_confirmation` | `0` | The estimated cost, in US dollars, above which starting a backfill needs `confirm_cost`. With `0`, any backfill into a priced space needs it. Api only. |
+
+Backfill concurrency controls overlap; `rate` still paces each batch. These limits apply per worker process. For hosted embeddings, also configure the plugin's `max_concurrent_requests`; provider `Retry-After` delays apply across that plugin process. Lower the limits for constrained providers or databases. Restart the worker after changing these engine limits.
+
+## Observability
+
+`observability` tunes the counters behind `/v0/admin/stats/*`. Every field is optional.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `flush_interval` | `5s` | How often each process writes its counts; a process that crashes loses at most this much |
+| `record_query_text` | `false` | Also count searches by their normalized query text, so the most frequent queries can be listed. The text is kept in PostgreSQL for 7 days and may hold personal or confidential information. |
+
+## Worker queues
+
+`worker.queues` selects `live`, `bulk`, or both. Omit `worker` to serve both queues with four activity slots each. `worker.slots.live` and `worker.slots.bulk` each accept 1–1024; omitted or zero values use four. An explicit empty queue list, duplicates, unknown queue names, negative slots and slots above 1024 refuse startup.
+
+For example, not run; this fragment selects a bulk worker:
+
+```json
+{"worker":{"queues":["bulk"],"slots":{"live":4,"bulk":2}}}
+```
+
+Each process has its own capacity. Multiple processes may serve the same queue: durable claims and stable Temporal workflow identities prevent duplicate dispatch. An ingestion activity processes up to sixteen documents concurrently within its slot; `backfill.concurrency` bounds preparation within a backfill slot. Optional ingestion evaluations retain their own `ingestion_evaluation_concurrency` slots per selected queue. Search requests run in API processes; alerts and webhook delivery run in live workers on their existing leased loops.
+
+Direct submissions and pushes use live. Scheduled connector acquisition defaults to live; set an instance's `work_queue` to `bulk` when creating an archive-scale source. The class is recorded on each run and accepted document, including serving publication and optional ingestion evaluation. Rebuilds, backfills and quarantine reprocessing use bulk. `backfill.rate` still paces background batches.
+
+The operator endpoint `GET /v0/admin/queues` requires a dedicated API key with only `queues:read` and `corpora: ["*"]`, distinct from API and operator keys. It reports installation-wide backlog from PostgreSQL, including accepted documents before publication and remaining rebuild, backfill and quarantine work. Processing stages deduplicate documents per queue. Rebuild and backfill waiting counts are estimates: the operation's scope minus covered/completed, skipped or quarantined versions and active operation attempts, clamped at zero. Their overlap with each other or other bulk stages can be counted more than once. Backfills use their [accepted estimate](/run-quivr/backfill-a-vector-space) until processing records the scope counter; rebuilds capture current eligible scope once in the background. Later corrections, withdrawals and coverage changes can make this scope differ from the current document set until the operation ends. These values are an autoscaling signal.
+
+`waiting` excludes active execution leases within each term; `in_progress` counts distinct documents with live attempts, whose leases expire within 15 seconds after a dead process. Completed attempt rows are removed; expired abandoned rows are pruned in bounded batches. Paused and terminal operations and alert retries scheduled in the future are excluded. Withdrawn documents leave the processing-stage counts; an operation's estimated scope may retain them. `oldest_waiting_age_seconds` is zero when no document waits; an estimated operation term uses its creation time.
+
+API and worker processes refresh one shared PostgreSQL snapshot under an advisory lock. `queue_observation.refresh_interval` defaults to `15s` and accepts `1s`–`60s`. The interval starts after successful publication, so a slow query does not trigger an immediate repeat. Readers reuse the snapshot between publications. Failures preserve the last good observation and log once per outage. Retry delays start at the configured interval and double up to the greater of 15 seconds and that interval; at intervals of 15 seconds or longer, retries use the configured interval. Refreshes have a 30-second budget. Only a rebuild's initial scope count scans its corpus; later operation observations read scope/progress counters. API requests and metrics scrapes read two snapshot rows. A missing snapshot, one older than two refresh intervals (at least one minute), or unavailable storage makes the queue API return 503 instead of a false zero. Metrics omit unavailable queue series while preserving other metric families; configure the scaler to fail on an empty result. Oldest waiting age advances from the query's observation cutoff between publications.
+
+API and worker probe addresses export these Prometheus gauges with `queue="live"` or `queue="bulk"`: `quivr_queue_waiting_documents`, `quivr_queue_in_progress_documents`, `quivr_queue_oldest_waiting_age_seconds`. OpenTelemetry exports the same observations when enabled. Every process reads the same installation-wide snapshot; aggregate replicas with `max`, not `sum`. Keep probe addresses private. See [Scale workers on backlog](/run-quivr/deploy#scale-workers-on-backlog) to scale workers with KEDA, `quivr-autoscaler` or by hand.

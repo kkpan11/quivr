@@ -1,0 +1,29 @@
+{
+  "name": "quivr-search",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build && node perf/bundle-budget.mjs",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "start": "node server.mjs",
+    "test": "node --test tests/server.test.mjs tests/perf-check.test.mjs tests/stats.test.mjs tests/feeds.test.mjs tests/alerts.test.mjs tests/admin.test.mjs tests/admin-plugins.test.mjs tests/explore.test.mjs tests/explorer-state.test.mjs tests/diff.test.mjs && playwright test",
+    "perf": "node perf/measure.mjs"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^6.1.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4"
+  }
+}
